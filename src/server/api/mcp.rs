@@ -18,7 +18,8 @@ use serde::Deserialize;
 
 use super::mutation_guard::ElevatedMutationGuard;
 use super::read_only_response;
-use super::{api_error, AppState};
+use super::{api_error, with_error_code, AppState};
+use crate::daemon::AoeErrorCode;
 use crate::session::config::profile_config;
 use crate::session::mcp::mcp_model::{self, McpProvenance, ResolvedMcpServer};
 use crate::session::mcp::mcp_overrides::{self, McpServerInput, McpWriteError};
@@ -242,7 +243,10 @@ fn write_error(error: McpWriteError) -> axum::response::Response {
             format!("an AoE-owned server named \"{name}\" already exists"),
         ),
         McpWriteError::NotFound(m) => api_error(StatusCode::NOT_FOUND, "mcp_server_not_found", m),
-        McpWriteError::ReadOnly(m) => api_error(StatusCode::FORBIDDEN, "mcp_read_only", m),
+        McpWriteError::ReadOnly(m) => with_error_code(
+            api_error(StatusCode::FORBIDDEN, "mcp_read_only", m),
+            AoeErrorCode::ReadOnly,
+        ),
         McpWriteError::Io(e) => {
             tracing::warn!(target: "acp.mcp", error = %e, "global mcp.json write failed");
             api_error(

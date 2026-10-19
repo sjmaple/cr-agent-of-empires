@@ -84,14 +84,31 @@ pub use telemetry::{
 use axum::http::StatusCode;
 use axum::response::{IntoResponse as _, Response};
 
-/// JSON error body shared by the API: `{"error": code, "message": message}`.
+use crate::daemon::AoeErrorCode;
+
+/// JSON error body shared by the API: `{"error": code, "message": message}`. A code that is
+/// one of the finite [`AoeErrorCode`] tokens for this status also sets the `AoE-Error-Code`
+/// header.
 pub(crate) fn api_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     let message: String = message.into();
-    (
+    let response = (
         status,
         axum::Json(serde_json::json!({ "error": code, "message": message })),
     )
-        .into_response()
+        .into_response();
+    match AoeErrorCode::from_error_token(status, code) {
+        Some(code) => with_error_code(response, code),
+        None => response,
+    }
+}
+
+/// Tags a response with the `AoE-Error-Code` header, keeping its status and body.
+pub(crate) fn with_error_code(mut response: Response, code: AoeErrorCode) -> Response {
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(AoeErrorCode::HEADER),
+        axum::http::HeaderValue::from_static(code.as_str()),
+    );
+    response
 }
 
 /// The stored row, which can differ from the daemon's cache when a peer such as the CLI
@@ -293,6 +310,32 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_code_header_follows_the_safe_token_and_status() {
+        let header =
+            |response: Response| AoeErrorCode::from_response(response.status(), response.headers());
+        assert_eq!(header(read_only_response()), Some(AoeErrorCode::ReadOnly));
+        assert_eq!(
+            header(cityhall_response()),
+            Some(AoeErrorCode::CityhallMode)
+        );
+        assert_eq!(
+            header(with_error_code(
+                api_error(StatusCode::FORBIDDEN, "skill_read_only", "m"),
+                AoeErrorCode::ReadOnly
+            )),
+            Some(AoeErrorCode::ReadOnly)
+        );
+        assert_eq!(
+            header(api_error(StatusCode::FORBIDDEN, "skill_read_only", "m")),
+            None
+        );
+        assert_eq!(
+            header(api_error(StatusCode::CONFLICT, "read_only", "m")),
+            None
+        );
+    }
 
     /// Mutating handlers by source file. Each must short-circuit in read-only
     /// mode and must extract any JSON body lazily, or axum's `Json<T>` 422s on a

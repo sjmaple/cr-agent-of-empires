@@ -7,8 +7,9 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::api_error;
 use super::mutation_guard::ElevatedMutationGuard;
+use super::{api_error, with_error_code};
+use crate::daemon::AoeErrorCode;
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
 
 fn skill_error(error: SkillError) -> Response {
@@ -20,9 +21,10 @@ fn skill_error(error: SkillError) -> Response {
             api_error(StatusCode::NOT_FOUND, "skill_not_found", message)
         }
         SkillError::Collision(message) => api_error(StatusCode::CONFLICT, "skill_exists", message),
-        SkillError::ReadOnly(message) => {
-            api_error(StatusCode::FORBIDDEN, "skill_read_only", message)
-        }
+        SkillError::ReadOnly(message) => with_error_code(
+            api_error(StatusCode::FORBIDDEN, "skill_read_only", message),
+            AoeErrorCode::ReadOnly,
+        ),
         SkillError::Io(error) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",

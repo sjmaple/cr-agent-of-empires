@@ -349,6 +349,11 @@ impl AoeErrorCode {
         }
     }
 
+    /// The code a server error body's `error` token maps to when it is consistent with `status`.
+    pub fn from_error_token(status: reqwest::StatusCode, token: &str) -> Option<Self> {
+        Self::from_token(token.as_bytes()).filter(|code| code.status() == status)
+    }
+
     /// The code carried by a response, or `None` when the header is absent, repeated,
     /// unknown, or inconsistent with the status.
     pub fn from_response(

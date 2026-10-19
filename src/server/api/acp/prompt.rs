@@ -10,6 +10,8 @@ use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, DiffCommentsPromptRequest, PromptRequest, ResolveApprovalRequest,
 };
+use crate::daemon::AoeErrorCode;
+use crate::server::api::with_error_code;
 use crate::server::session_service::{PromptTouch, SendTurnError, SendTurnRequest, SessionCaller};
 
 use super::*;
@@ -485,11 +487,14 @@ pub async fn resolve_approval(
     match outcome {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         // The nonce echo lets clients match the 404 to the card (#1821).
-        Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
-            StatusCode::NOT_FOUND,
-            format!("no pending approval with nonce {nonce_str}"),
-        )
-            .into_response(),
+        Err(SupervisorError::Acp(AcpError::UnknownNonce)) => with_error_code(
+            (
+                StatusCode::NOT_FOUND,
+                format!("no pending approval with nonce {nonce_str}"),
+            )
+                .into_response(),
+            AoeErrorCode::PendingTargetGone,
+        ),
         Err(e) => supervisor_error_response("resolve failed", &e),
     }
 }
@@ -514,11 +519,14 @@ pub async fn resolve_elicitation(
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
-            StatusCode::NOT_FOUND,
-            format!("no pending elicitation with nonce {nonce_str}"),
-        )
-            .into_response(),
+        Err(SupervisorError::Acp(AcpError::UnknownNonce)) => with_error_code(
+            (
+                StatusCode::NOT_FOUND,
+                format!("no pending elicitation with nonce {nonce_str}"),
+            )
+                .into_response(),
+            AoeErrorCode::PendingTargetGone,
+        ),
         // The elicitation stays pending, so the client can correct and resubmit.
         Err(SupervisorError::Acp(AcpError::InvalidAnswer(msg))) => {
             (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()

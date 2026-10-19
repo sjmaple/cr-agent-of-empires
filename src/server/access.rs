@@ -196,11 +196,14 @@ pub(super) fn evaluate_access(
 /// Uniform 403 for every DNS-rebinding rejection.
 pub(super) fn access_denied() -> axum::response::Response {
     use axum::response::IntoResponse;
-    (
-        axum::http::StatusCode::FORBIDDEN,
-        "forbidden: host or origin not allowed",
+    super::api::with_error_code(
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "forbidden: host or origin not allowed",
+        )
+            .into_response(),
+        crate::daemon::AoeErrorCode::AccessPolicyDenied,
     )
-        .into_response()
 }
 
 /// DNS-rebinding gate.
