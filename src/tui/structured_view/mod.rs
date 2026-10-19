@@ -927,6 +927,7 @@ async fn handle_terminal_event(
                         format!("approval failed: {e}"),
                         ToastKind::Error,
                     );
+                    refresh_pending_if_unconfirmed(state, &e).await;
                 }
             }
             Ok(false)
@@ -958,6 +959,7 @@ async fn handle_terminal_event(
                         format!("elicitation resolve failed: {e}"),
                         ToastKind::Error,
                     );
+                    refresh_pending_if_unconfirmed(state, &e).await;
                 }
             }
             Ok(false)
@@ -1348,6 +1350,7 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
                         format!("approval failed: {e}"),
                         ToastKind::Error,
                     );
+                    refresh_pending_if_unconfirmed(state, &e).await;
                 }
             }
         }
@@ -1384,6 +1387,7 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
                         format!("answer failed: {e}"),
                         ToastKind::Error,
                     );
+                    refresh_pending_if_unconfirmed(state, &e).await;
                 }
             }
         }
@@ -1804,6 +1808,24 @@ async fn ws_connect_projections_only(
     ws_connect_with(endpoint, session_id, since, false).await
 }
 
+/// A resolve the daemon could not confirm leaves the card alone. A fresh WS connect
+/// snapshot re-reads the authoritative pending set and drops the card only if the daemon
+/// no longer lists it; the old socket stays when the new one cannot connect.
+async fn refresh_pending_if_unconfirmed(state: &mut StructuredViewState, error: &HttpError) {
+    if !matches!(error, HttpError::PendingUnconfirmed) {
+        return;
+    }
+    let since = state.transcript.last_seq;
+    match ws_connect_projections_only(&state.endpoint, &state.session_id, since).await {
+        Ok(fresh) => {
+            if let Some(old) = state.ws.replace(fresh) {
+                old.shutdown().await;
+            }
+        }
+        Err(e) => tracing::warn!(target: "acp.tui", "pending refresh failed: {e}"),
+    }
+}
+
 /// Fetch the server-folded transcript rows via `?view=rows` and reconcile
 /// them into the row buffer. Used on open and after a lag (a lag does not
 /// reconnect the socket, so no fresh `transcript_snapshot` arrives).
@@ -1911,7 +1933,6 @@ mod tests {
         assert!(!should_retry_plugin_ui_poll(&HttpError::Unauthorized));
         assert!(should_retry_plugin_ui_poll(&HttpError::Server {
             status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-            body: "locked".into(),
         }));
     }
 

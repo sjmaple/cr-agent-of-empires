@@ -16,6 +16,7 @@ use crate::acp::protocol::{
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
 use crate::acp::transcript::TranscriptRow;
+use crate::daemon::AoeErrorCode;
 use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -103,10 +104,30 @@ pub enum HttpError {
     /// Worded for every auth mode, not only token auth (#1525).
     #[error("daemon rejected the request (401); restart `aoe serve` or check `--auth` mode")]
     Unauthorized,
-    #[error("daemon returned HTTP {status}: {body}")]
-    Server { status: StatusCode, body: String },
+    /// A refusal the daemon named with a safe `AoE-Error-Code`.
+    #[error("{}", refusal_message(*.0))]
+    Refused(AoeErrorCode),
+    /// A resolve 404 without `pending_target_gone`: the card may or may not still be
+    /// pending, so the caller keeps it and re-reads the daemon's pending set.
+    #[error("daemon could not confirm the pending request; refreshing")]
+    PendingUnconfirmed,
+    #[error("daemon returned HTTP {status}")]
+    Server { status: StatusCode },
     #[error(transparent)]
     Daemon(#[from] crate::daemon::DaemonClientError),
+}
+
+fn refusal_message(code: AoeErrorCode) -> &'static str {
+    match code {
+        AoeErrorCode::AccessPolicyDenied => {
+            "daemon refused the request: host or origin not allowed"
+        }
+        AoeErrorCode::CityhallMode => "this action is disabled in CityHall client mode",
+        AoeErrorCode::LifecycleLocked => "daemon lifecycle is locked; try again shortly",
+        AoeErrorCode::TlsRequired => "daemon requires HTTPS; use an https:// endpoint",
+        AoeErrorCode::ReadOnly => "daemon is read-only; request refused",
+        AoeErrorCode::PendingTargetGone => "pending request already resolved",
+    }
 }
 
 impl From<reqwest::Error> for HttpError {
@@ -175,9 +196,12 @@ impl HttpClient {
         if status.is_success() {
             return Ok(res);
         }
-        let body = res.text().await.unwrap_or_default();
-        if !is_elevation_required(status, &body) {
-            return Err(classify_error(status, &body, scope));
+        // Elevation is named only in the error body, which is never read. A 403 with no
+        // safe code and a passphrase to confirm gets one step-up attempt.
+        let unnamed_forbidden = status == StatusCode::FORBIDDEN
+            && AoeErrorCode::from_response(status, res.headers()).is_none();
+        if !unnamed_forbidden || self.endpoint.resolved_passphrase().is_none() {
+            return Err(classify_error(status, res.headers(), scope));
         }
         passphrase_session::elevate(&self.endpoint, &self.passphrase_session).await?;
         let res = self.send_authed(&build).await?;
@@ -528,8 +552,7 @@ impl HttpClient {
         if status.is_success() {
             return Ok(());
         }
-        let text = res.text().await.unwrap_or_default();
-        Err(classify_resolve_error(status, &text, nonce, session_id))
+        Err(classify_resolve_error(status, res.headers(), session_id))
     }
 
     /// `option_id` names an option chosen through the option picker.
@@ -671,11 +694,7 @@ impl HttpClient {
         if status.is_success() {
             return Ok(());
         }
-        let body = res.text().await.unwrap_or_default();
-        match status {
-            StatusCode::UNAUTHORIZED => Err(HttpError::Unauthorized),
-            _ => Err(HttpError::Server { status, body }),
-        }
+        Err(classify_error(status, res.headers(), Scope::Global))
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -765,53 +784,41 @@ async fn finish(res: reqwest::Response, scope: Scope<'_>) -> Result<reqwest::Res
     if status.is_success() {
         return Ok(res);
     }
-    let body = res.text().await.unwrap_or_default();
-    Err(classify_error(status, &body, scope))
+    Err(classify_error(status, res.headers(), scope))
 }
 
-/// Whether a 403 names the `elevation_required` error: a plugin-mutation
-/// endpoint's signal that the caller is logged in but has not step-up
-/// confirmed the passphrase within the last 15 minutes (`src/server/login.rs`
-/// `ELEVATION_LIFETIME`). Checks the `error` field rather than substring
-/// matching so an unrelated body mentioning the same word never misfires.
-fn is_elevation_required(status: StatusCode, body: &str) -> bool {
-    status == StatusCode::FORBIDDEN
-        && serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .and_then(|v| v.get("error")?.as_str().map(|e| e == "elevation_required"))
-            .unwrap_or(false)
-}
-
-fn classify_error(status: StatusCode, body: &str, scope: Scope<'_>) -> HttpError {
-    match (status, scope) {
-        (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
-        (StatusCode::FORBIDDEN, _) if body.contains("read-only") || body.contains("read_only") => {
-            HttpError::ReadOnly
-        }
-        (StatusCode::NOT_FOUND, Scope::Session(session_id)) => {
+/// Status plus the safe `AoE-Error-Code` header decide the error. The body is never read,
+/// so a stalled or reflecting server can neither delay nor steer classification.
+fn classify_error(status: StatusCode, headers: &header::HeaderMap, scope: Scope<'_>) -> HttpError {
+    if status == StatusCode::UNAUTHORIZED {
+        return HttpError::Unauthorized;
+    }
+    // `pending_target_gone` is only valid on a resolve operation, which has its own classifier.
+    let code = AoeErrorCode::from_response(status, headers)
+        .filter(|code| *code != AoeErrorCode::PendingTargetGone);
+    match (code, scope) {
+        (Some(AoeErrorCode::ReadOnly), _) => HttpError::ReadOnly,
+        (Some(code), _) => HttpError::Refused(code),
+        (None, Scope::Session(session_id)) if status == StatusCode::NOT_FOUND => {
             HttpError::SessionNotFound(session_id.to_string())
         }
-        _ => HttpError::Server {
-            status,
-            body: body.to_string(),
-        },
+        (None, _) => HttpError::Server { status },
     }
 }
 
-/// Only the resolve endpoints mint `ApprovalGone`, and only for a 404 naming
-/// this nonce (#1821).
+/// Only the resolve endpoints mint `ApprovalGone`, and only for a 404 the daemon coded
+/// `pending_target_gone`. Any other 404 leaves the card to the authoritative refresh.
 fn classify_resolve_error(
     status: StatusCode,
-    body: &str,
-    nonce: &str,
+    headers: &header::HeaderMap,
     session_id: &str,
 ) -> HttpError {
-    let names_gone_target =
-        body.contains("no pending approval") || body.contains("no pending elicitation");
-    if status == StatusCode::NOT_FOUND && names_gone_target && body.contains(nonce) {
-        HttpError::ApprovalGone
-    } else {
-        classify_error(status, body, Scope::Session(session_id))
+    if status != StatusCode::NOT_FOUND {
+        return classify_error(status, headers, Scope::Session(session_id));
+    }
+    match AoeErrorCode::from_response(status, headers) {
+        Some(AoeErrorCode::PendingTargetGone) => HttpError::ApprovalGone,
+        _ => HttpError::PendingUnconfirmed,
     }
 }
 
@@ -953,74 +960,96 @@ mod tests {
         );
     }
 
+    fn coded(code: Option<&str>) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        if let Some(code) = code {
+            headers.insert(AoeErrorCode::HEADER, code.parse().unwrap());
+        }
+        headers
+    }
+
     #[test]
     fn error_classification() {
         let session = Scope::Session("s-1");
-        let gone =
-            |body: &str| classify_resolve_error(StatusCode::NOT_FOUND, body, "abc-123", "s-1");
+        let resolve = |status, code| classify_resolve_error(status, &coded(code), "s-1");
         assert!(matches!(
-            gone("no pending approval with nonce abc-123"),
+            resolve(StatusCode::NOT_FOUND, Some("pending_target_gone")),
             HttpError::ApprovalGone
         ));
-        assert!(matches!(
-            gone("no pending elicitation with nonce abc-123"),
-            HttpError::ApprovalGone
-        ));
-        for body in [
-            "no pending approval with nonce other-999",
-            "session has no running structured view",
-        ] {
-            assert!(matches!(gone(body), HttpError::SessionNotFound(s) if s == "s-1"));
+        // A generic or old-server 404 never clears a card, whatever its body said.
+        for code in [None, Some("unknown"), Some("read_only")] {
+            assert!(matches!(
+                resolve(StatusCode::NOT_FOUND, code),
+                HttpError::PendingUnconfirmed
+            ));
         }
+        assert!(matches!(
+            resolve(StatusCode::FORBIDDEN, Some("read_only")),
+            HttpError::ReadOnly
+        ));
         // The shared classifier never mints ApprovalGone.
         assert!(matches!(
-            classify_error(StatusCode::NOT_FOUND, "no pending approval with that nonce", session),
+            classify_error(StatusCode::NOT_FOUND, &coded(Some("pending_target_gone")), session),
             HttpError::SessionNotFound(s) if s == "s-1"
         ));
         assert!(matches!(
-            classify_error(StatusCode::NOT_FOUND, "", Scope::Global),
+            classify_error(StatusCode::NOT_FOUND, &coded(None), Scope::Global),
             HttpError::Server { .. }
         ));
         assert!(matches!(
-            classify_error(StatusCode::UNAUTHORIZED, "", session),
+            classify_error(StatusCode::UNAUTHORIZED, &coded(Some("read_only")), session),
             HttpError::Unauthorized
         ));
+        for (status, code, want) in [
+            (StatusCode::FORBIDDEN, "read_only", None),
+            (
+                StatusCode::FORBIDDEN,
+                "access_policy_denied",
+                Some(AoeErrorCode::AccessPolicyDenied),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                "cityhall_mode",
+                Some(AoeErrorCode::CityhallMode),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "lifecycle_locked",
+                Some(AoeErrorCode::LifecycleLocked),
+            ),
+            (
+                StatusCode::UPGRADE_REQUIRED,
+                "tls_required",
+                Some(AoeErrorCode::TlsRequired),
+            ),
+        ] {
+            let error = classify_error(status, &coded(Some(code)), Scope::Global);
+            match want {
+                Some(want) => assert!(matches!(error, HttpError::Refused(c) if c == want)),
+                None => assert!(matches!(error, HttpError::ReadOnly)),
+            }
+        }
+        // Unknown, status-inconsistent or body-only evidence stays generic.
+        for (status, code) in [
+            (StatusCode::FORBIDDEN, None),
+            (StatusCode::FORBIDDEN, Some("elevation_required")),
+            (StatusCode::CONFLICT, Some("read_only")),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("tls_required")),
+        ] {
+            assert!(matches!(
+                classify_error(status, &coded(code), session),
+                HttpError::Server { .. }
+            ));
+        }
+        let mut duplicate = coded(Some("read_only"));
+        duplicate.append(AoeErrorCode::HEADER, "read_only".parse().unwrap());
         assert!(matches!(
-            classify_error(StatusCode::FORBIDDEN, "daemon is read-only", Scope::Global),
-            HttpError::ReadOnly
-        ));
-        assert!(matches!(
-            classify_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", session),
+            classify_error(StatusCode::FORBIDDEN, &duplicate, session),
             HttpError::Server { .. }
         ));
         // #1525: the 401 message must not blame a token env var.
         let rendered = HttpError::Unauthorized.to_string();
         assert!(!rendered.contains("AOE_DAEMON_TOKEN") && rendered.contains("401"));
-    }
-
-    #[test]
-    fn is_elevation_required_matches_only_the_named_error_on_403() {
-        assert!(is_elevation_required(
-            StatusCode::FORBIDDEN,
-            r#"{"error":"elevation_required","message":"Re-enter the passphrase to continue"}"#
-        ));
-        // Wrong status, right body shape.
-        assert!(!is_elevation_required(
-            StatusCode::UNAUTHORIZED,
-            r#"{"error":"elevation_required"}"#
-        ));
-        // Right status, different error.
-        assert!(!is_elevation_required(
-            StatusCode::FORBIDDEN,
-            r#"{"error":"read_only","message":"Server is in read-only mode"}"#
-        ));
-        // The substring appears only inside `message`, not as the `error` value.
-        assert!(!is_elevation_required(
-            StatusCode::FORBIDDEN,
-            r#"{"error":"read_only","message":"see elevation_required docs"}"#
-        ));
-        // Malformed body.
-        assert!(!is_elevation_required(StatusCode::FORBIDDEN, "not json"));
     }
 
     #[tokio::test]
@@ -1202,5 +1231,84 @@ mod tests {
         client.list_sessions(None).await.unwrap();
         assert_eq!(daemon.logins(), 1);
         assert_eq!(daemon.list_requests().len(), 3);
+    }
+
+    /// Serves every connection the status line and headers, then never the promised body.
+    async fn stalled_body_server(head: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer).await;
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (base, server)
+    }
+
+    /// Classification comes from status and `AoE-Error-Code` alone: a server that promises
+    /// a body and never sends it cannot delay it, and an old server without the header
+    /// degrades to the generic status.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn error_classification_does_not_wait_for_the_body() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let head = |status: &str, code: Option<&str>| -> &'static str {
+            let code = code
+                .map(|code| format!("AoE-Error-Code: {code}\r\n"))
+                .unwrap_or_default();
+            Box::leak(
+                format!("HTTP/1.1 {status}\r\n{code}Content-Length: 1000000\r\n\r\n")
+                    .into_boxed_str(),
+            )
+        };
+        let deadline = Duration::from_secs(10);
+        for (status, code, expect) in [
+            ("404 Not Found", Some("pending_target_gone"), "gone"),
+            ("404 Not Found", None, "unconfirmed"),
+            ("403 Forbidden", Some("read_only"), "read_only"),
+            ("500 Internal Server Error", None, "server"),
+        ] {
+            let (base, server) = stalled_body_server(head(status, code)).await;
+            let client =
+                HttpClient::new(DaemonEndpoint::new(base, Some("tok".into()), Source::Env))
+                    .unwrap();
+            let error = tokio::time::timeout(
+                deadline,
+                client.resolve_approval("s-1", "n-1", ApprovalDecisionWire::Allow, None),
+            )
+            .await
+            .expect("resolve waited on the error body")
+            .unwrap_err();
+            let matched = match (&error, expect) {
+                (HttpError::ApprovalGone, "gone") => true,
+                (HttpError::PendingUnconfirmed, "unconfirmed") => true,
+                (HttpError::ReadOnly, "read_only") => true,
+                (HttpError::Server { .. }, "server") => true,
+                _ => false,
+            };
+            assert!(matched, "{status} {code:?}: {error}");
+            server.abort();
+        }
+
+        let (base, server) =
+            stalled_body_server(head("426 Upgrade Required", Some("tls_required"))).await;
+        let client =
+            HttpClient::new(DaemonEndpoint::new(base, Some("tok".into()), Source::Env)).unwrap();
+        let error = tokio::time::timeout(deadline, client.health_check())
+            .await
+            .expect("health check waited on the error body")
+            .unwrap_err();
+        assert!(
+            matches!(error, HttpError::Refused(AoeErrorCode::TlsRequired)),
+            "{error}"
+        );
+        server.abort();
     }
 }

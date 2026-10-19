@@ -100,8 +100,7 @@ pub(crate) async fn login(
     let res = client.post(url).json(&body).send().await?;
     let status = res.status();
     if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(map_auth_error(status, body));
+        return Err(map_auth_error(status));
     }
     let cookie = extract_session_cookie(res.headers()).ok_or(HttpError::Unauthorized)?;
     let session = PassphraseSession {
@@ -117,10 +116,10 @@ pub(crate) async fn login(
 /// way: a wrong passphrase is `Unauthorized` (mirrors the daemon's own
 /// wording for both endpoints), anything else (rate limiting, a locked-out
 /// session) is a generic server error the caller surfaces verbatim.
-fn map_auth_error(status: StatusCode, body: String) -> HttpError {
+fn map_auth_error(status: StatusCode) -> HttpError {
     match status {
         StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
-        _ => HttpError::Server { status, body },
+        _ => HttpError::Server { status },
     }
 }
 
@@ -150,8 +149,7 @@ pub(super) async fn elevate(
     if status.is_success() {
         return Ok(());
     }
-    let body = res.text().await.unwrap_or_default();
-    Err(map_auth_error(status, body))
+    Err(map_auth_error(status))
 }
 
 /// Login secrets are only sent over a secure transport, never follow redirects, and never
@@ -479,11 +477,11 @@ mod tests {
     #[test]
     fn map_auth_error_distinguishes_unauthorized_from_generic() {
         assert!(matches!(
-            map_auth_error(StatusCode::UNAUTHORIZED, "bad passphrase".into()),
+            map_auth_error(StatusCode::UNAUTHORIZED),
             HttpError::Unauthorized
         ));
         assert!(matches!(
-            map_auth_error(StatusCode::TOO_MANY_REQUESTS, "locked out".into()),
+            map_auth_error(StatusCode::TOO_MANY_REQUESTS),
             HttpError::Server { status, .. } if status == StatusCode::TOO_MANY_REQUESTS
         ));
     }
