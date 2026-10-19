@@ -1286,13 +1286,13 @@ mod tests {
             .await
             .expect("resolve waited on the error body")
             .unwrap_err();
-            let matched = match (&error, expect) {
-                (HttpError::ApprovalGone, "gone") => true,
-                (HttpError::PendingUnconfirmed, "unconfirmed") => true,
-                (HttpError::ReadOnly, "read_only") => true,
-                (HttpError::Server { .. }, "server") => true,
-                _ => false,
-            };
+            let matched = matches!(
+                (&error, expect),
+                (HttpError::ApprovalGone, "gone")
+                    | (HttpError::PendingUnconfirmed, "unconfirmed")
+                    | (HttpError::ReadOnly, "read_only")
+                    | (HttpError::Server { .. }, "server")
+            );
             assert!(matched, "{status} {code:?}: {error}");
             server.abort();
         }
