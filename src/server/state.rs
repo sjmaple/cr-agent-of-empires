@@ -85,6 +85,8 @@ pub struct AppState {
     pub passkey_manager: Arc<super::passkeys::PasskeyManager>,
     pub rate_limiter: Arc<RateLimiter>,
     pub behind_tunnel: bool,
+    /// Per-bind opt-out of the 426 plaintext-remote gate (`--dangerously-allow-plaintext-remote`).
+    pub allow_plaintext_remote: bool,
     /// Coarse auth mode resolved once at launch (`"token"` / `"passphrase"` / `"none"`).
     pub auth_mode: &'static str,
     /// Coarse exposure mode resolved once at launch from the active transport (`"tunnel"` /

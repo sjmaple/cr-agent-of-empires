@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::auth::resolve_client_ip;
+use super::ingress::Ingress;
 use super::secure_store::{check_path_security, write_private};
 use super::AppState;
 use crate::util::{now_ms, system_time_to_ms};
@@ -821,7 +821,7 @@ pub async fn login_handler(
     headers: axum::http::HeaderMap,
     login_body: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, &headers);
+    let client_ip = Ingress::resolve(addr, &headers, state.behind_tunnel).client_ip;
 
     if !state.login_manager.is_enabled() {
         return (
@@ -919,7 +919,7 @@ pub async fn elevate_handler(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, request.headers());
+    let client_ip = Ingress::resolve(addr, request.headers(), state.behind_tunnel).client_ip;
 
     if !state.login_manager.is_enabled() {
         return (

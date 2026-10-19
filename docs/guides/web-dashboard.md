@@ -53,7 +53,8 @@ aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com
 | `--host` | 127.0.0.1 | Bind address; `0.0.0.0` for LAN/VPN access |
 | `--auth` | `token` | `token` (URL token), `passphrase` (login wall only), `none` (loopback only unless `--behind-proxy`). `--no-auth` is an alias for `none` |
 | `--passphrase` | | Passphrase for the login wall, also read from `AOE_SERVE_PASSPHRASE`. Valid with `--auth=token` and `--auth=passphrase` |
-| `--behind-proxy` | off | An external proxy terminates TLS: sets `; Secure` cookies and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers. Spawns no tunnel and requires at least one `--allowed-host` |
+| `--behind-proxy` | off | An external proxy terminates TLS: sets `; Secure` cookies and trusts `X-Forwarded-For`, `cf-connecting-ip` and `X-Forwarded-Proto` from loopback peers, and from no one else. Spawns no tunnel and requires at least one `--allowed-host` |
+| `--dangerously-allow-plaintext-remote` | off | Accept plain HTTP from non-loopback peers instead of answering `426`; see [Security](#security) |
 | `--allowed-host` | | Extra `Host` the [DNS-rebinding gate](#dns-rebinding) accepts (repeatable) |
 | `--allowed-origin` | | Extra browser `Origin` to accept (repeatable, full `scheme://host[:port]`); only needed for a proxy on a nonstandard port |
 | `--remote` | off | Expose over an HTTPS tunnel |
@@ -74,7 +75,7 @@ aoe serve --host 127.0.0.1 --port 42041 \
   --behind-proxy --allowed-host aoe.example.com
 ```
 
-The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP, and only when the socket peer is loopback, so a misconfigured upstream cannot spoof it. `--behind-proxy` also withdraws the same-host bypass, so a browser on the daemon's own host signs in with the passphrase like any other client, and the local TUI and `aoe acp` commands log in with the daemon's own `serve.passphrase`. Add `--allowed-origin https://aoe.example.com:8443` when the proxy listens on a nonstandard port. Both flags are replayed across `aoe serve --restart`.
+The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`) and `X-Forwarded-Proto: https`; aoe reads the last value of each, and only when the socket peer is loopback, so a client or misconfigured upstream cannot spoof them. A request whose client address is missing, malformed or loopback is still an outside caller. `--behind-proxy` (and `--remote`) withdraws the same-host bypass for every connection to the port, so a browser on the daemon's own host signs in with the passphrase like any other client, and the local TUI and `aoe acp` commands log in with the daemon's own `serve.passphrase`. A proxy that reaches aoe over a network instead of loopback must be tunnelled to loopback first. Add `--allowed-origin https://aoe.example.com:8443` when the proxy listens on a nonstandard port. Both flags are replayed across `aoe serve --restart`.
 
 ### Running under systemd
 
@@ -86,6 +87,7 @@ The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the l
 
 - **Token auth** (default): a random 256-bit token generated at startup and stored in `serve.token` in the app dir, passed by URL on first visit, then kept as an `HttpOnly; SameSite=Strict` cookie.
 - **Passphrase wall**: an argon2-hashed passphrase gates `/login`, and sessions bind to a per-device secret in `localStorage`, so a leaked cookie alone is not enough. Five failed logins from an IP trigger a 15-minute lockout.
+- **Plaintext refusal**: plain HTTP from a non-loopback peer gets `426` before authentication, so tokens and passphrases never cross a network in the clear. A TLS proxy or tunnel in front of a loopback bind is unaffected. A direct bind to a LAN or tailnet IP without a proxy needs `--dangerously-allow-plaintext-remote` (per bind, logged at every start), or `tailscale serve` in front of a loopback bind. Native clients likewise refuse to send a token or passphrase to a plaintext non-loopback endpoint.
 - **Token rotation**: in `--remote` mode the token rotates every 4 hours, with a 5-minute grace for active sessions.
 - **Connected devices**: signed-in devices (browser, origin IP, last seen) are listed under Settings > Web Dashboard > Connected Devices, where you can revoke one or sign every device out.
 - **Session persistence**: login sessions persist to an owner-only `login_sessions.toml`, so devices stay signed in across a daemon restart. A passphrase change drops them all; `auth.persist_sessions = false` opts out.
@@ -113,11 +115,11 @@ aoe serve --host 0.0.0.0 --allowed-host my-box.tailnet.ts.net
 
 - **Localhost** (`aoe serve`): same security as the TUI.
 - **Remote via tunnel** (`--remote`): HTTPS; recommended for phone access.
-- **Over a VPN** (`--host 0.0.0.0` on Tailscale/WireGuard): the VPN encrypts.
+- **Over a VPN** (`--host 0.0.0.0` on Tailscale/WireGuard): the VPN encrypts, but aoe cannot verify that, so pass `--dangerously-allow-plaintext-remote`.
 - **Behind a reverse proxy** (`--auth=passphrase --behind-proxy`): TLS upstream, passphrase as the only human gate.
 - **Read-only** (`--read-only`): monitor without input.
 
-Refused outright: `--auth=none --host 0.0.0.0` without `--behind-proxy`, and `--remote` with either reduced auth mode. Plain `--host 0.0.0.0` on public WiFi is unencrypted HTTP; use a VPN or a tunnel.
+Refused outright: `--auth=none --host 0.0.0.0` without `--behind-proxy`, and `--remote` with either reduced auth mode. Plain `--host 0.0.0.0` on public WiFi would be unencrypted HTTP, which is why it is refused without the opt-out; use a VPN or a tunnel.
 
 ## Installing as a PWA
 

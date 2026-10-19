@@ -155,6 +155,8 @@ pub struct ServerConfig<'a> {
     pub passphrase: Option<&'a str>,
     /// True when the server sits behind an external reverse proxy that terminates TLS.
     pub behind_proxy: bool,
+    /// Per-bind opt-out of the 426 plaintext-remote gate.
+    pub allow_plaintext_remote: bool,
     pub open_browser: bool,
     /// Operator-supplied `--allowed-host` entries, merged with the derived
     /// loopback/bind/tunnel set by `resolve_access_policy`. See #2735.
@@ -244,6 +246,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         is_daemon,
         passphrase,
         behind_proxy,
+        allow_plaintext_remote,
         open_browser,
         extra_allowed_hosts,
         extra_allowed_origins,
@@ -662,6 +665,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         ?allowed_origins,
         "resolved DNS-rebinding allowlist"
     );
+    if allow_plaintext_remote {
+        tracing::warn!(
+            target: "http.access",
+            "DANGEROUS: plaintext HTTP from non-loopback peers is allowed by \
+             --dangerously-allow-plaintext-remote"
+        );
+    } else {
+        tracing::info!(
+            target: "http.access",
+            "plaintext HTTP from non-loopback peers is rejected with 426"
+        );
+    }
 
     let state = Arc::new(AppState {
         profile: profile.to_string(),
@@ -675,6 +690,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
+        allow_plaintext_remote,
         auth_mode,
         serve_mode,
         allowed_hosts,

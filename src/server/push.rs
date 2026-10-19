@@ -960,6 +960,7 @@ pub async fn get_vapid_public_key(
 /// token's hash.
 pub async fn subscribe(
     State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Extension(auth): Extension<AuthenticatedTokenHash>,
     headers: HeaderMap,
     body: Result<Json<SubscribeBody>, axum::extract::rejection::JsonRejection>,
@@ -985,7 +986,10 @@ pub async fn subscribe(
         .unwrap_or("")
         .to_string();
 
-    let origin = extract_request_origin(&headers).unwrap_or_default();
+    let externally_secure =
+        crate::server::ingress::Ingress::resolve(peer, &headers, state.behind_tunnel)
+            .externally_secure;
+    let origin = extract_request_origin(&headers, externally_secure).unwrap_or_default();
 
     let sub = Subscription {
         endpoint: body.endpoint,
@@ -1005,7 +1009,8 @@ pub async fn subscribe(
 }
 
 /// Extract the client's origin (scheme + host + optional port) from the request headers.
-pub fn extract_request_origin(headers: &HeaderMap) -> Option<String> {
+/// Without an `Origin` header the scheme is `https` only when a trusted proxy asserted it.
+pub fn extract_request_origin(headers: &HeaderMap, externally_secure: bool) -> Option<String> {
     let origin_header = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -1017,13 +1022,7 @@ pub fn extract_request_origin(headers: &HeaderMap) -> Option<String> {
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())?;
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("https");
+    let scheme = if externally_secure { "https" } else { "http" };
     Some(format!("{scheme}://{host}"))
 }
 
@@ -1360,11 +1359,11 @@ mod tests {
     }
 
     /// The push URL's origin comes from the Origin header when the browser sent one,
-    /// otherwise from the proxy's forwarded scheme plus Host. A `null` Origin (an opaque
-    /// context) is no signal, and a forwarded-proto chain names its first hop.
+    /// otherwise from the trusted proxy's asserted scheme plus Host. A `null` Origin (an opaque
+    /// context) is no signal.
     #[test]
     fn extract_request_origin_prefers_origin_then_forwarded_host() {
-        let origin = |headers: &[(&str, &str)]| {
+        let origin = |headers: &[(&str, &str)], secure: bool| {
             let mut h = HeaderMap::new();
             for (name, value) in headers {
                 h.insert(
@@ -1372,11 +1371,11 @@ mod tests {
                     value.parse().unwrap(),
                 );
             }
-            extract_request_origin(&h)
+            extract_request_origin(&h, secure)
         };
         let host = ("host", "aoe.example.com");
 
-        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], Option<&'a str>);
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], bool, Option<&'a str>);
         let cases: &[Case] = &[
             (
                 "origin wins over host",
@@ -1384,37 +1383,37 @@ mod tests {
                     ("origin", "http://localhost:42041"),
                     ("host", "ignored.example"),
                 ],
+                false,
                 Some("http://localhost:42041"),
             ),
             (
                 "trailing slash trimmed",
                 &[("origin", "https://aoe.example.com/")],
+                false,
                 Some("https://aoe.example.com"),
             ),
             (
                 "null origin falls back to host",
                 &[("origin", "null"), host],
+                true,
                 Some("https://aoe.example.com"),
             ),
             (
-                "forwarded proto",
-                &[("x-forwarded-proto", "https"), host],
-                Some("https://aoe.example.com"),
-            ),
-            (
-                "forwarded proto chain takes the first hop",
-                &[("x-forwarded-proto", "https, http"), host],
-                Some("https://aoe.example.com"),
-            ),
-            (
-                "host alone defaults to https",
+                "a trusted proxy's https assertion",
                 &[host],
+                true,
                 Some("https://aoe.example.com"),
             ),
-            ("no signal", &[], None),
+            (
+                "an unasserted scheme is never https",
+                &[("x-forwarded-proto", "https"), host],
+                false,
+                Some("http://aoe.example.com"),
+            ),
+            ("no signal", &[], false, None),
         ];
-        for (name, headers, want) in cases {
-            assert_eq!(origin(headers).as_deref(), *want, "{name}");
+        for (name, headers, secure, want) in cases {
+            assert_eq!(origin(headers, *secure).as_deref(), *want, "{name}");
         }
 
         let with_origin = |origin: &str| Subscription {

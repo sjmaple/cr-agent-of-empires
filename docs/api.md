@@ -6,6 +6,8 @@
 
 Protected routes follow the configured authentication mode. Token authentication accepts `Authorization: Bearer <token>`, a `?token=` query parameter, or the `aoe_token` cookie. Passphrase authentication uses `/api/login` and a device-bound `aoe_session` cookie. A daemon running `--auth none` needs no credential. Read-only mode (`--read-only`) answers write endpoints with `403 read_only`.
 
+Native clients classify errors from the status and one `AoE-Error-Code` response header, never from the body: `read_only`, `access_policy_denied` and `cityhall_mode` (all `403`), `pending_target_gone` (`404`, approval and elicitation resolve only) and `tls_required` (`426`). A missing, repeated, unknown or status-inconsistent value means "generic status". Plain HTTP from a non-loopback peer gets `426 tls_required` before authentication unless the bind sets `--dangerously-allow-plaintext-remote`.
+
 ## Runtime CLI reads
 
 Read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` is reserved for the TUI stream and does not serve this one-shot protocol.

@@ -1,0 +1,338 @@
+//! Per-request ingress provenance and the plaintext-remote gate.
+//!
+//! Forwarded headers are read here and nowhere else, and only from the immediate peer of a
+//! configured proxy (`proxy_mode`, whose trusted peers are the loopback addresses every
+//! supported proxy and tunnel terminates onto). Everything downstream reads the resulting
+//! [`Ingress`] instead of re-deriving trust from raw headers.
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
+
+use super::AppState;
+
+/// Rate-limit and login key for a proxied request that names no valid client address.
+/// Such callers share one bucket; none is ever mistaken for the loopback peer.
+const UNKNOWN_CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ingress {
+    /// Identity for login attempts and auth rate limiting.
+    pub client_ip: IpAddr,
+    /// A same-host caller exempt from login and elevation: a direct loopback connection
+    /// with no proxy mode. Never derived from a forwarded address.
+    pub local_trusted: bool,
+    /// The connection is not known to be encrypted and is not a direct loopback one.
+    pub plaintext_remote: bool,
+    /// A trusted proxy asserted that the client connected over HTTPS.
+    pub externally_secure: bool,
+}
+
+impl Ingress {
+    pub(crate) fn resolve(peer: SocketAddr, headers: &HeaderMap, proxy_mode: bool) -> Self {
+        let peer_ip = peer.ip().to_canonical();
+        let via_trusted_proxy = proxy_mode && peer_ip.is_loopback();
+        let forwarded_proto = via_trusted_proxy
+            .then(|| last_list_element(headers, "x-forwarded-proto"))
+            .flatten();
+        let externally_secure = forwarded_proto.is_some_and(|p| p.eq_ignore_ascii_case("https"));
+        let forwarded_plaintext = forwarded_proto.is_some() && !externally_secure;
+        Self {
+            client_ip: if via_trusted_proxy {
+                forwarded_client_ip(headers)
+            } else {
+                peer_ip
+            },
+            local_trusted: !proxy_mode && peer_ip.is_loopback(),
+            plaintext_remote: !externally_secure && (!peer_ip.is_loopback() || forwarded_plaintext),
+            externally_secure,
+        }
+    }
+}
+
+/// The last comma-separated element of the last line of `name`: the entry the nearest proxy
+/// appended, which a client cannot forge.
+fn last_list_element<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let line = headers.get_all(name).iter().next_back()?.to_str().ok()?;
+    line.rsplit(',').next().map(str::trim)
+}
+
+/// `cf-connecting-ip` when the proxy sent it, else the last `x-forwarded-for` element. A
+/// missing, repeated or malformed value is [`UNKNOWN_CLIENT`].
+fn forwarded_client_ip(headers: &HeaderMap) -> IpAddr {
+    let mut cf = headers.get_all("cf-connecting-ip").iter();
+    let parsed = match (cf.next(), cf.next()) {
+        (Some(_), Some(_)) => None,
+        (Some(value), None) => value.to_str().ok().and_then(|v| v.trim().parse().ok()),
+        (None, _) => {
+            last_list_element(headers, "x-forwarded-for").and_then(|v| v.parse::<IpAddr>().ok())
+        }
+    };
+    parsed.unwrap_or(UNKNOWN_CLIENT)
+}
+
+/// Rejects plaintext non-loopback requests with 426 before any other gate runs, unless
+/// the bind explicitly opted out.
+pub(super) async fn plaintext_gate(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let ingress = Ingress::resolve(peer, request.headers(), state.behind_tunnel);
+    if ingress.plaintext_remote && !state.allow_plaintext_remote {
+        tracing::debug!(target: "http.access", peer = %peer.ip(), "rejected plaintext remote request");
+        return super::api::api_error(
+            StatusCode::UPGRADE_REQUIRED,
+            "tls_required",
+            "HTTPS is required for non-loopback connections",
+        );
+    }
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve(peer: &str, headers: &[(&'static str, &str)], proxy_mode: bool) -> Ingress {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.append(*name, value.parse().unwrap());
+        }
+        Ingress::resolve(SocketAddr::new(ip(peer), 4000), &map, proxy_mode)
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn forwarded_headers_count_only_from_a_loopback_peer_in_proxy_mode() {
+        let forged = [
+            ("cf-connecting-ip", "203.0.113.50"),
+            ("x-forwarded-for", "203.0.113.50"),
+            ("x-forwarded-proto", "https"),
+        ];
+        // Without proxy mode, even a loopback peer's headers are ignored.
+        let direct = resolve("127.0.0.1", &forged, false);
+        assert_eq!(direct.client_ip, ip("127.0.0.1"));
+        assert!(direct.local_trusted && !direct.externally_secure && !direct.plaintext_remote);
+        // A remote peer cannot assert TLS or identity in either mode.
+        for proxy_mode in [false, true] {
+            let remote = resolve("198.51.100.7", &forged, proxy_mode);
+            assert_eq!(remote.client_ip, ip("198.51.100.7"));
+            assert!(!remote.local_trusted && !remote.externally_secure);
+            assert!(remote.plaintext_remote, "proxy_mode={proxy_mode}");
+        }
+        let proxied = resolve("127.0.0.1", &forged, true);
+        assert_eq!(proxied.client_ip, ip("203.0.113.50"));
+        assert!(proxied.externally_secure && !proxied.plaintext_remote);
+    }
+
+    /// A proxy that names no client, a malformed or repeated client, or a loopback client
+    /// is never a local owner, and never keys login or rate limiting to the loopback peer.
+    #[test]
+    fn proxy_mode_is_never_local_trusted_whatever_identity_the_proxy_sends() {
+        for headers in [
+            &[][..],
+            &[("x-forwarded-for", "not-an-ip")],
+            &[
+                ("cf-connecting-ip", "not-an-ip"),
+                ("x-forwarded-for", "203.0.113.5"),
+            ],
+            &[
+                ("cf-connecting-ip", "203.0.113.5"),
+                ("cf-connecting-ip", "203.0.113.6"),
+            ],
+            &[("cf-connecting-ip", "127.0.0.1")],
+            &[("x-forwarded-for", "::1")],
+        ] {
+            let ingress = resolve("127.0.0.1", headers, true);
+            assert!(!ingress.local_trusted, "{headers:?}");
+        }
+        for headers in [
+            &[][..],
+            &[("x-forwarded-for", "not-an-ip")],
+            &[
+                ("cf-connecting-ip", "not-an-ip"),
+                ("x-forwarded-for", "203.0.113.5"),
+            ],
+            &[
+                ("cf-connecting-ip", "203.0.113.5"),
+                ("cf-connecting-ip", "203.0.113.6"),
+            ],
+        ] {
+            assert_eq!(
+                resolve("127.0.0.1", headers, true).client_ip,
+                UNKNOWN_CLIENT
+            );
+        }
+        assert_eq!(
+            resolve(
+                "127.0.0.1",
+                &[("x-forwarded-for", "spoofed, 203.0.113.9")],
+                true
+            )
+            .client_ip,
+            ip("203.0.113.9"),
+            "the last hop is the one the proxy appended"
+        );
+        assert_eq!(
+            resolve(
+                "127.0.0.1",
+                &[
+                    ("cf-connecting-ip", "203.0.113.50"),
+                    ("x-forwarded-for", "10.0.0.1")
+                ],
+                true
+            )
+            .client_ip,
+            ip("203.0.113.50")
+        );
+    }
+
+    #[test]
+    fn plaintext_gate_applies_to_remote_peers_and_proxies_asserting_http() {
+        let cases: &[(&str, &[(&'static str, &str)], bool, bool)] = &[
+            // (peer, headers, proxy_mode, plaintext_remote)
+            ("127.0.0.1", &[], false, false),
+            ("127.0.0.1", &[], true, false),
+            ("::1", &[], true, false),
+            ("203.0.113.9", &[], false, true),
+            ("203.0.113.9", &[("x-forwarded-proto", "https")], true, true),
+            ("127.0.0.1", &[("x-forwarded-proto", "https")], true, false),
+            ("127.0.0.1", &[("x-forwarded-proto", "HTTPS")], true, false),
+            ("127.0.0.1", &[("x-forwarded-proto", "http")], true, true),
+            (
+                "127.0.0.1",
+                &[("x-forwarded-proto", "http, https")],
+                true,
+                false,
+            ),
+            (
+                "127.0.0.1",
+                &[("x-forwarded-proto", "https, http")],
+                true,
+                true,
+            ),
+        ];
+        for (peer, headers, proxy_mode, want) in cases {
+            assert_eq!(
+                resolve(peer, headers, *proxy_mode).plaintext_remote,
+                *want,
+                "{peer} {headers:?} proxy_mode={proxy_mode}"
+            );
+        }
+    }
+
+    mod router {
+        use std::net::SocketAddr;
+
+        use axum::extract::ConnectInfo;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        use crate::daemon::AoeErrorCode;
+        use crate::server::test_support::{build_router_for_test, build_test_app_state_ingress};
+
+        const TOKEN: &str = "secret-token";
+
+        async fn probe(
+            state: std::sync::Arc<crate::server::AppState>,
+            peer: &str,
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, Option<AoeErrorCode>) {
+            let mut builder = Request::builder().uri("/api/sessions");
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder.body(axum::body::Body::empty()).unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                format!("{peer}:5555").parse::<SocketAddr>().unwrap(),
+            ));
+            let response = build_router_for_test(state).oneshot(request).await.unwrap();
+            let code = AoeErrorCode::from_response(response.status(), response.headers());
+            (response.status(), code)
+        }
+
+        const TLS_REQUIRED: (StatusCode, Option<AoeErrorCode>) = (
+            StatusCode::UPGRADE_REQUIRED,
+            Some(AoeErrorCode::TlsRequired),
+        );
+
+        /// Remote plaintext gets 426 before the Host gate and before auth, whatever it
+        /// presents; loopback and an explicit opt-out reach the later gates.
+        #[tokio::test]
+        async fn remote_plaintext_is_rejected_before_host_and_auth_gates() {
+            let strict = || build_test_app_state_ingress(Some(TOKEN.into()), None, false, false);
+            let bearer = format!("Bearer {TOKEN}");
+            for headers in [
+                &[][..],
+                &[("host", "evil.example")],
+                &[("host", "localhost"), ("authorization", bearer.as_str())],
+            ] {
+                assert_eq!(probe(strict(), "203.0.113.9", headers).await, TLS_REQUIRED);
+            }
+            let (status, code) = probe(strict(), "127.0.0.1", &[("host", "localhost")]).await;
+            assert_eq!((status, code), (StatusCode::UNAUTHORIZED, None));
+            let opted_out = build_test_app_state_ingress(Some(TOKEN.into()), None, false, true);
+            let (status, _) = probe(opted_out, "203.0.113.9", &[("host", "localhost")]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn only_a_trusted_proxy_can_assert_https() {
+            let proxy = || build_test_app_state_ingress(Some(TOKEN.into()), None, true, false);
+            let https = [("host", "localhost"), ("x-forwarded-proto", "https")];
+            // A remote peer's assertion is ignored, with or without proxy mode.
+            assert_eq!(probe(proxy(), "203.0.113.9", &https).await, TLS_REQUIRED);
+            let plain = build_test_app_state_ingress(Some(TOKEN.into()), None, false, false);
+            assert_eq!(probe(plain, "203.0.113.9", &https).await, TLS_REQUIRED);
+            // The loopback proxy's assertion passes the gate and lands on auth.
+            let (status, _) = probe(proxy(), "127.0.0.1", &https).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            // A trusted proxy that says the client used plain HTTP is not exempt.
+            let http = [("host", "localhost"), ("x-forwarded-proto", "http")];
+            assert_eq!(probe(proxy(), "127.0.0.1", &http).await, TLS_REQUIRED);
+        }
+
+        /// A trusted loopback HTTPS proxy that names no client, a malformed one or a
+        /// loopback one gets no login or elevation exemption, with a bearer token alone
+        /// (token plus passphrase) and with the passphrase wall alone.
+        #[tokio::test]
+        async fn proxied_loopback_clients_do_not_bypass_login() {
+            let bearer = format!("Bearer {TOKEN}");
+            for identity in [
+                &[][..],
+                &[("x-forwarded-for", "not-an-ip")],
+                &[("cf-connecting-ip", "127.0.0.1")],
+                &[("x-forwarded-for", "::1")],
+            ] {
+                let mut headers = vec![
+                    ("host", "localhost"),
+                    ("x-forwarded-proto", "https"),
+                    ("authorization", bearer.as_str()),
+                ];
+                headers.extend_from_slice(identity);
+                for (token, why) in [
+                    (Some(TOKEN.to_string()), "token+passphrase"),
+                    (None, "passphrase"),
+                ] {
+                    let proxied =
+                        build_test_app_state_ingress(token.clone(), Some("hunter2"), true, false);
+                    let (status, _) = probe(proxied, "127.0.0.1", &headers).await;
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{why} {identity:?}");
+                    // The same request without proxy mode is a direct local owner.
+                    let direct = build_test_app_state_ingress(token, Some("hunter2"), false, false);
+                    let (status, _) = probe(direct, "127.0.0.1", &headers).await;
+                    assert_eq!(status, StatusCode::OK, "direct {why}");
+                }
+            }
+        }
+    }
+}

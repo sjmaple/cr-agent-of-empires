@@ -23,7 +23,8 @@ use webauthn_rs::prelude::{
 };
 
 use super::access::norm_host;
-use super::auth::{resolve_client_ip, AuthenticatedSession};
+use super::auth::AuthenticatedSession;
+use super::ingress::Ingress;
 use super::login::{
     argon2_verify, decode_binding_secret, hash_passphrase, issue_session, session_id_from_headers,
 };
@@ -600,7 +601,7 @@ pub async fn login_start_handler(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = Ingress::resolve(addr, &headers, state.behind_tunnel).client_ip;
     if !state.login_manager.is_enabled() {
         return login_disabled();
     }
@@ -637,7 +638,7 @@ pub async fn login_finish_handler(
     headers: HeaderMap,
     body: Result<Json<LoginFinishRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = Ingress::resolve(addr, &headers, state.behind_tunnel).client_ip;
     if !state.login_manager.is_enabled() {
         return login_disabled();
     }
