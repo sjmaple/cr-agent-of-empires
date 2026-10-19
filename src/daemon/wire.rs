@@ -301,9 +301,131 @@ pub struct ListSessionsQuery {
     pub state: Option<SessionScope>,
 }
 
+/// Finite, server-owned error classification carried in the `AoE-Error-Code` response
+/// header. Clients classify from status plus this header and never from a response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AoeErrorCode {
+    ReadOnly,
+    AccessPolicyDenied,
+    CityhallMode,
+    LifecycleLocked,
+    PendingTargetGone,
+    TlsRequired,
+}
+
+impl AoeErrorCode {
+    pub const HEADER: &'static str = "aoe-error-code";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::AccessPolicyDenied => "access_policy_denied",
+            Self::CityhallMode => "cityhall_mode",
+            Self::LifecycleLocked => "lifecycle_locked",
+            Self::PendingTargetGone => "pending_target_gone",
+            Self::TlsRequired => "tls_required",
+        }
+    }
+
+    fn from_token(token: &[u8]) -> Option<Self> {
+        Some(match token {
+            b"read_only" => Self::ReadOnly,
+            b"access_policy_denied" => Self::AccessPolicyDenied,
+            b"cityhall_mode" => Self::CityhallMode,
+            b"lifecycle_locked" => Self::LifecycleLocked,
+            b"pending_target_gone" => Self::PendingTargetGone,
+            b"tls_required" => Self::TlsRequired,
+            _ => return None,
+        })
+    }
+
+    pub fn status(self) -> reqwest::StatusCode {
+        use reqwest::StatusCode;
+        match self {
+            Self::ReadOnly | Self::AccessPolicyDenied | Self::CityhallMode => StatusCode::FORBIDDEN,
+            Self::LifecycleLocked => StatusCode::CONFLICT,
+            Self::PendingTargetGone => StatusCode::NOT_FOUND,
+            Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
+        }
+    }
+
+    /// The code carried by a response, or `None` when the header is absent, repeated,
+    /// unknown, or inconsistent with the status.
+    pub fn from_response(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Option<Self> {
+        let mut values = headers.get_all(Self::HEADER).iter();
+        let value = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        Self::from_token(value.as_bytes()).filter(|code| code.status() == status)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_code_requires_one_known_status_consistent_header() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        use reqwest::StatusCode;
+
+        let headers = |values: &[&str]| {
+            let mut map = HeaderMap::new();
+            for value in values {
+                map.append(AoeErrorCode::HEADER, HeaderValue::from_str(value).unwrap());
+            }
+            map
+        };
+        let cases: &[(StatusCode, &[&str], Option<AoeErrorCode>)] = &[
+            (
+                StatusCode::FORBIDDEN,
+                &["read_only"],
+                Some(AoeErrorCode::ReadOnly),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                &["access_policy_denied"],
+                Some(AoeErrorCode::AccessPolicyDenied),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                &["cityhall_mode"],
+                Some(AoeErrorCode::CityhallMode),
+            ),
+            (
+                StatusCode::CONFLICT,
+                &["lifecycle_locked"],
+                Some(AoeErrorCode::LifecycleLocked),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                &["pending_target_gone"],
+                Some(AoeErrorCode::PendingTargetGone),
+            ),
+            (
+                StatusCode::UPGRADE_REQUIRED,
+                &["tls_required"],
+                Some(AoeErrorCode::TlsRequired),
+            ),
+            (StatusCode::FORBIDDEN, &[], None),
+            (StatusCode::FORBIDDEN, &["unknown"], None),
+            (StatusCode::FORBIDDEN, &["READ_ONLY"], None),
+            (StatusCode::FORBIDDEN, &["read_only", "read_only"], None),
+            (StatusCode::NOT_FOUND, &["read_only"], None),
+            (StatusCode::CONFLICT, &["pending_target_gone"], None),
+        ];
+        for (status, values, expected) in cases {
+            assert_eq!(
+                AoeErrorCode::from_response(*status, &headers(values)),
+                *expected,
+                "{status} {values:?}"
+            );
+        }
+    }
 
     #[test]
     fn session_rows_and_envelope_decode_from_minimal_payloads() {
