@@ -83,13 +83,15 @@ pub const REPLAY_PAGE_SIZE: u64 = 1000;
 pub struct HttpClient {
     http: reqwest::Client,
     endpoint: DaemonEndpoint,
+    /// False for plaintext HTTP to a non-loopback host: no credential may be sent.
+    credentials_allowed: bool,
     passphrase_session: PassphraseSessionCache,
 }
 
 #[derive(Debug, Error)]
 pub enum HttpError {
     #[error("transport error: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(reqwest::Error),
     #[error("structured view session {0} not found on the daemon")]
     SessionNotFound(String),
     /// The approval or elicitation already resolved server-side, so the card
@@ -107,6 +109,13 @@ pub enum HttpError {
     Daemon(#[from] crate::daemon::DaemonClientError),
 }
 
+impl From<reqwest::Error> for HttpError {
+    /// The URL is dropped: a base path can itself carry a secret.
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.without_url())
+    }
+}
+
 /// Which endpoint family a request belongs to, deciding what a 404 means.
 #[derive(Clone, Copy)]
 enum Scope<'a> {
@@ -118,12 +127,13 @@ enum Scope<'a> {
 
 impl HttpClient {
     pub fn new(endpoint: DaemonEndpoint) -> Result<Self, HttpError> {
-        let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+        let url = crate::daemon::parse_base_url(&endpoint.base_url)?;
+        let http = crate::daemon::credentialed_client_builder(&url)
             .user_agent(concat!("aoe-acp-client/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             http,
+            credentials_allowed: crate::daemon::require_secure_credential_transport(&url).is_ok(),
             endpoint,
             passphrase_session: PassphraseSessionCache::default(),
         })
@@ -547,19 +557,20 @@ impl HttpClient {
             .await
     }
 
-    /// The shared session list, authenticated like every other request: bearer
-    /// token, else passphrase-login session (one re-login if a cached session
-    /// is rejected), else none.
+    /// The shared session list, authenticated like every other request: a cached
+    /// passphrase-login session, else bearer token, else a fresh passphrase login, else
+    /// none, with the same single 401 retry as [`Self::send_authed`].
     pub async fn list_sessions(
         &self,
         state: Option<crate::session::SessionScope>,
     ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
-        let had_cached_session = self.endpoint.resolved_token().is_none()
-            && self.passphrase_session.get(&self.endpoint).is_some();
-        match self.list_sessions_once(state).await {
-            Err(HttpError::Unauthorized) if had_cached_session => {
+        let has_passphrase = self.endpoint.resolved_passphrase().is_some();
+        let cached = has_passphrase && self.passphrase_session.get(&self.endpoint).is_some();
+        let bearer_first = self.endpoint.resolved_token().is_some() && !cached;
+        match self.list_sessions_once(state, false).await {
+            Err(HttpError::Unauthorized) if has_passphrase && (cached || bearer_first) => {
                 self.passphrase_session.invalidate(&self.endpoint);
-                self.list_sessions_once(state).await
+                self.list_sessions_once(state, true).await
             }
             result => result,
         }
@@ -568,11 +579,18 @@ impl HttpClient {
     async fn list_sessions_once(
         &self,
         state: Option<crate::session::SessionScope>,
+        force_session: bool,
     ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
         let base_url = &self.endpoint.base_url;
-        let client = if let Some(token) = self.endpoint.resolved_token() {
+        let has_passphrase = self.endpoint.resolved_passphrase().is_some();
+        let cached = has_passphrase && self.passphrase_session.get(&self.endpoint).is_some();
+        let token = self
+            .endpoint
+            .resolved_token()
+            .filter(|_| !(has_passphrase && (force_session || cached)));
+        let client = if let Some(token) = token {
             crate::daemon::DaemonClient::new(base_url, Some(&token))
-        } else if self.endpoint.resolved_passphrase().is_some() {
+        } else if has_passphrase {
             let session = self.ensure_passphrase_session().await?;
             crate::daemon::DaemonClient::with_session(
                 base_url,
@@ -667,25 +685,34 @@ impl HttpClient {
         }
     }
 
-    /// Attach whichever credential is available: a bearer token when one
-    /// resolves (`--auth=token`, unchanged), otherwise the passphrase-login
-    /// cookie (`--auth=passphrase`), logging in on first use. Neither
-    /// resolving (`--auth=none`, or no daemon credential at all) leaves the
-    /// request untouched.
+    /// Attach whichever credential is available. A cached passphrase-login session wins
+    /// over a bearer token (a daemon that requires both factors rejects the bearer alone);
+    /// otherwise a bearer token when one resolves, else the passphrase session, logging in
+    /// on first use. `force_session` skips the bearer. Neither resolving (`--auth=none`)
+    /// leaves the request untouched. Refuses before any send when the transport would
+    /// expose the credential.
     async fn authed_builder(
         &self,
         builder: reqwest::RequestBuilder,
-    ) -> Result<reqwest::RequestBuilder, HttpError> {
-        if self.endpoint.resolved_token().is_some() {
-            return Ok(self.auth(builder));
+        force_session: bool,
+    ) -> Result<(reqwest::RequestBuilder, Credential), HttpError> {
+        let has_token = self.endpoint.resolved_token().is_some();
+        let has_passphrase = self.endpoint.resolved_passphrase().is_some();
+        let cached = has_passphrase && self.passphrase_session.get(&self.endpoint).is_some();
+        if (has_token || has_passphrase) && !self.credentials_allowed {
+            return Err(crate::daemon::DaemonClientError::InsecureCredentialTransport.into());
         }
-        if self.endpoint.resolved_passphrase().is_some() {
+        if has_token && !(force_session || cached) {
+            return Ok((self.auth(builder), Credential::Bearer));
+        }
+        if has_passphrase {
             let session = self.ensure_passphrase_session().await?;
-            return Ok(builder
+            let builder = builder
                 .header(header::COOKIE, session.cookie)
-                .header("X-Aoe-Device-Binding", session.binding_secret));
+                .header("X-Aoe-Device-Binding", session.binding_secret);
+            return Ok((builder, Credential::Session { cached }));
         }
-        Ok(builder)
+        Ok((builder, Credential::None))
     }
 
     async fn ensure_passphrase_session(
@@ -697,25 +724,40 @@ impl HttpClient {
         passphrase_session::login(&self.endpoint, &self.passphrase_session).await
     }
 
-    /// Build, authenticate, and send a request via `build`, retrying once
-    /// after a fresh passphrase login if a *cached* session came back 401
-    /// (rotated passphrase, expired or evicted session). A first-ever login
-    /// failure, or a 401 with a bearer token, is not retried: the credential
-    /// itself is wrong, not merely stale.
+    /// Build, authenticate, and send a request via `build`. A 401 is retried once through
+    /// a fresh passphrase login when a *cached* session was stale (rotated passphrase,
+    /// expired or evicted session), or when a bearer token alone was refused and a
+    /// passphrase resolves (a daemon that also requires the second factor). A first-ever
+    /// login failure is not retried: the credential itself is wrong.
     async fn send_authed(
         &self,
         mut build: impl FnMut() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, HttpError> {
-        let had_cached_session = self.passphrase_session.get(&self.endpoint).is_some();
-        let request = self.authed_builder(build()).await?;
+        let (request, credential) = self.authed_builder(build(), false).await?;
         let response = request.send().await?;
-        if !had_cached_session || response.status() != StatusCode::UNAUTHORIZED {
+        if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
-        self.passphrase_session.invalidate(&self.endpoint);
-        let request = self.authed_builder(build()).await?;
+        match credential {
+            Credential::Session { cached: true } => {
+                self.passphrase_session.invalidate(&self.endpoint)
+            }
+            Credential::Bearer if self.endpoint.resolved_passphrase().is_some() => {}
+            _ => return Ok(response),
+        }
+        let (request, _) = self.authed_builder(build(), true).await?;
         Ok(request.send().await?)
     }
+}
+
+/// Which credential `authed_builder` attached.
+enum Credential {
+    None,
+    Bearer,
+    /// `cached` is false when this call performed the login.
+    Session {
+        cached: bool,
+    },
 }
 
 async fn finish(res: reqwest::Response, scope: Scope<'_>) -> Result<reqwest::Response, HttpError> {
@@ -781,9 +823,10 @@ mod tests {
     async fn authorization(endpoint: DaemonEndpoint) -> Option<String> {
         let client = HttpClient::new(endpoint).unwrap();
         let request = client
-            .authed_builder(client.request(Method::GET, "/api/sessions"))
+            .authed_builder(client.request(Method::GET, "/api/sessions"), false)
             .await
             .unwrap()
+            .0
             .build()
             .unwrap();
         request
@@ -837,9 +880,10 @@ mod tests {
         ))
         .unwrap();
         let request = client
-            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"), false)
             .await
             .unwrap()
+            .0
             .build()
             .unwrap();
         assert!(request.headers().get(header::AUTHORIZATION).is_none());
@@ -860,9 +904,10 @@ mod tests {
         let client = HttpClient::new(daemon_endpoint).unwrap();
 
         let request = client
-            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"), false)
             .await
             .unwrap()
+            .0
             .build()
             .unwrap();
         assert_eq!(
@@ -891,9 +936,10 @@ mod tests {
             });
 
         let request = client
-            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"), false)
             .await
             .unwrap()
+            .0
             .build()
             .unwrap();
         assert!(request.headers().get(header::AUTHORIZATION).is_none());
@@ -1040,5 +1086,121 @@ mod tests {
             body,
             &serde_json::json!({"config_id": "reasoning_effort", "value": "high"})
         );
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn credentials_are_refused_before_any_send_to_plaintext_remote() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let client = HttpClient::new(DaemonEndpoint::new(
+            "http://203.0.113.9:8080".into(),
+            Some("tok".into()),
+            Source::Env,
+        ))
+        .unwrap();
+        let refused = |error: HttpError| {
+            matches!(
+                error,
+                HttpError::Daemon(crate::daemon::DaemonClientError::InsecureCredentialTransport)
+            )
+        };
+        assert!(refused(client.health_check().await.unwrap_err()));
+        assert!(refused(client.replay("s-1", 0).await.unwrap_err()));
+        assert!(refused(
+            client
+                .resolve_approval("s-1", "n", ApprovalDecisionWire::Cancelled, None)
+                .await
+                .unwrap_err()
+        ));
+        assert!(refused(client.list_sessions(None).await.unwrap_err()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authenticated_requests_do_not_follow_redirects() {
+        use futures_util::FutureExt;
+        use tokio::io::AsyncWriteExt;
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", origin.local_addr().unwrap());
+        let location = format!("http://{}/api/sessions", target.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let response =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n");
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client =
+            HttpClient::new(DaemonEndpoint::new(base, Some("tok".into()), Source::Env)).unwrap();
+        let error = client.health_check().await.unwrap_err();
+        server.await.unwrap();
+        assert!(
+            matches!(error, HttpError::Server { status, .. } if status == StatusCode::FOUND),
+            "{error}"
+        );
+        assert!(
+            target.accept().now_or_never().is_none(),
+            "the redirect target was contacted"
+        );
+    }
+
+    #[test]
+    fn debug_and_transport_errors_carry_no_credential_or_base_path() {
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:1/base-secret".into(),
+            Some("secret-token".into()),
+            Source::Env,
+        );
+        let client = HttpClient::new(endpoint.clone()).unwrap();
+        for rendered in [format!("{client:?}"), format!("{endpoint:?}")] {
+            assert!(!rendered.contains("secret-token"), "{rendered}");
+            assert!(!rendered.contains("base-secret"), "{rendered}");
+        }
+        for url in [
+            "http://user:pw@127.0.0.1:1",
+            "http://127.0.0.1:1?token=x",
+            "http://127.0.0.1:1#frag",
+        ] {
+            let endpoint = DaemonEndpoint::new(url.into(), None, Source::Env);
+            assert!(HttpClient::new(endpoint).is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_failure_message_omits_the_request_url() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/base-secret", listener.local_addr().unwrap());
+        drop(listener);
+        let client =
+            HttpClient::new(DaemonEndpoint::new(base, Some("tok".into()), Source::Env)).unwrap();
+        let error = client.health_check().await.unwrap_err();
+        assert!(matches!(error, HttpError::Transport(_)), "{error}");
+        assert!(!format!("{error:?} {error}").contains("base-secret"));
+    }
+
+    /// A daemon that requires the passphrase factor on top of the bearer token rejects the
+    /// bearer alone; the client logs in, retries once, and then prefers the session.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bearer_refused_for_a_second_factor_falls_back_to_a_passphrase_login() {
+        use super::passphrase_session::test_daemon::TestDaemon;
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let daemon = TestDaemon::start(super::passphrase_session::test_daemon::PASSPHRASE).await;
+        let client = HttpClient::new(daemon.endpoint_with_token("tok")).unwrap();
+
+        client.list_sessions(None).await.unwrap();
+        assert_eq!(daemon.logins(), 1);
+        let requests = daemon.list_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.is_none(), "first attempt is bearer only");
+        assert!(requests[1]
+            .0
+            .as_deref()
+            .is_some_and(|c| c.starts_with("aoe_session=")));
+
+        client.list_sessions(None).await.unwrap();
+        assert_eq!(daemon.logins(), 1);
+        assert_eq!(daemon.list_requests().len(), 3);
     }
 }

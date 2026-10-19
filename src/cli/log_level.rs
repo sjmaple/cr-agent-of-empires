@@ -39,20 +39,27 @@ pub async fn run(args: LogLevelArgs) -> Result<()> {
     let endpoint = format!("{base}/api/log-level");
     let token = extract_token(&primary.url);
 
-    let client = reqwest::Client::new();
+    let url = crate::daemon::parse_base_url(base)?;
+    if token.is_some() {
+        crate::daemon::require_secure_credential_transport(&url)?;
+    }
+    let client = crate::daemon::credentialed_client_builder(&url).build()?;
 
     if args.get || (args.level.is_none() && args.filter.is_none()) {
         let mut req = client.get(&endpoint);
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let resp = req.send().await.context("GET /api/log-level")?;
+        let resp = req
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("GET /api/log-level")?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("server returned {status}: {body}");
+            bail!("server returned {status}");
         }
-        println!("{body}");
+        println!("{}", resp.text().await.unwrap_or_default());
         return Ok(());
     }
 
@@ -76,13 +83,16 @@ pub async fn run(args: LogLevelArgs) -> Result<()> {
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let resp = req.send().await.context("PATCH /api/log-level")?;
+    let resp = req
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("PATCH /api/log-level")?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("server returned {status}: {text}");
+        bail!("server returned {status}");
     }
-    println!("{text}");
+    println!("{}", resp.text().await.unwrap_or_default());
     Ok(())
 }
 

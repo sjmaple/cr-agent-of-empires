@@ -13,7 +13,6 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use reqwest::header::{self, HeaderMap};
 use reqwest::StatusCode;
@@ -23,11 +22,8 @@ use super::http::HttpError;
 
 const DEVICE_BINDING_FILENAME: &str = "cli_device_binding";
 const SESSION_COOKIE_FILENAME: &str = "cli_login_session";
-/// Matches `HttpClient`'s own `DEFAULT_TIMEOUT`; a fresh client is built for
-/// the login POST (see `login_client`), so the value isn't shared directly.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct PassphraseSession {
     /// Full `aoe_session=<id>` pair, ready to send as the `Cookie` header.
     pub(crate) cookie: String,
@@ -36,10 +32,23 @@ pub(crate) struct PassphraseSession {
     pub(crate) binding_secret: String,
 }
 
+impl std::fmt::Debug for PassphraseSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassphraseSession").finish_non_exhaustive()
+    }
+}
+
 /// In-memory cache for one `HttpClient`, backed by an on-disk cache (see
 /// `DaemonEndpoint::session_cache_dir`).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PassphraseSessionCache(Arc<RwLock<Option<PassphraseSession>>>);
+
+impl std::fmt::Debug for PassphraseSessionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassphraseSessionCache")
+            .finish_non_exhaustive()
+    }
+}
 
 impl PassphraseSessionCache {
     /// Cached session, loading it from disk on first use this process.
@@ -145,32 +154,13 @@ pub(super) async fn elevate(
     Err(map_auth_error(status, body))
 }
 
-/// Login secrets never follow redirects or use a proxy for a loopback destination.
+/// Login secrets are only sent over a secure transport, never follow redirects, and never
+/// use a proxy for a loopback destination.
 fn login_client(url: impl reqwest::IntoUrl) -> Result<(reqwest::Client, reqwest::Url), HttpError> {
     let url = url.into_url()?;
-    Ok((login_client_builder(&url).build()?, url))
-}
-
-fn login_client_builder(url: &reqwest::Url) -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder()
-        .timeout(LOGIN_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none());
-    let builder = if crate::daemon::is_loopback_url(url) {
-        builder.no_proxy()
-    } else {
-        builder
-    };
-    if url.host_str() == Some("localhost") {
-        builder.resolve_to_addrs(
-            "localhost",
-            &[
-                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
-            ],
-        )
-    } else {
-        builder
-    }
+    crate::daemon::require_secure_credential_transport(&url)?;
+    let client = crate::daemon::credentialed_client_builder(&url).build()?;
+    Ok((client, url))
 }
 
 fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -313,7 +303,7 @@ mod tests {
             let url: reqwest::Url = format!("http://localhost:{port}/api/login")
                 .parse()
                 .unwrap();
-            let client = login_client_builder(&url)
+            let client = crate::daemon::credentialed_client_builder(&url)
                 .dns_resolver(Arc::new(HostileDns))
                 .build()
                 .unwrap();
@@ -531,6 +521,7 @@ pub(crate) mod test_daemon {
     pub(crate) struct TestDaemon {
         inner: Arc<Mutex<Inner>>,
         pub(crate) endpoint: DaemonEndpoint,
+        passphrase_path: std::path::PathBuf,
         _dir: tempfile::TempDir,
         server: tokio::task::JoinHandle<()>,
     }
@@ -554,13 +545,24 @@ pub(crate) mod test_daemon {
                 None,
                 Source::LocalDaemon,
             )
-            .with_local_passphrase_path(path);
+            .with_local_passphrase_path(path.clone());
             Self {
                 inner,
                 endpoint,
+                passphrase_path: path,
                 _dir: dir,
                 server,
             }
+        }
+
+        /// The same daemon with a bearer token as well, for a daemon requiring both factors.
+        pub(crate) fn endpoint_with_token(&self, token: &str) -> DaemonEndpoint {
+            DaemonEndpoint::new(
+                self.endpoint.base_url.clone(),
+                Some(token.to_string()),
+                Source::LocalDaemon,
+            )
+            .with_local_passphrase_path(self.passphrase_path.clone())
         }
 
         pub(crate) fn logins(&self) -> usize {

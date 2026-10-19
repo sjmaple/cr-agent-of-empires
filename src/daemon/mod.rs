@@ -103,16 +103,11 @@ impl DaemonClient {
         credentials: Vec<(HeaderName, HeaderValue)>,
     ) -> Result<Self, DaemonClientError> {
         let sessions_url = sessions_url(base_url)?;
-        if !credentials.is_empty()
-            && sessions_url.scheme() == "http"
-            && !is_loopback_url(&sessions_url)
-        {
-            return Err(DaemonClientError::InsecureCredentialTransport);
+        if !credentials.is_empty() {
+            require_secure_credential_transport(&sessions_url)?;
         }
-        let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+        let http = credentialed_client_builder(&sessions_url)
             .user_agent(concat!("aoe-daemon-client/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(DaemonClientError::ClientBuild)?;
         Ok(Self {
@@ -274,8 +269,10 @@ pub(crate) fn is_loopback_address(host: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn sessions_url(base_url: &str) -> Result<Url, DaemonClientError> {
-    let mut base = Url::parse(base_url).map_err(|_| DaemonClientError::InvalidBaseUrl {
+/// A daemon base URL with no credentials, query or fragment: those are where a secret
+/// would otherwise end up in a log line or an error.
+pub(crate) fn parse_base_url(base_url: &str) -> Result<Url, DaemonClientError> {
+    let base = Url::parse(base_url).map_err(|_| DaemonClientError::InvalidBaseUrl {
         reason: "could not parse URL",
     })?;
     if !matches!(base.scheme(), "http" | "https") {
@@ -298,6 +295,43 @@ fn sessions_url(base_url: &str) -> Result<Url, DaemonClientError> {
             reason: "URL must not include a query or fragment",
         });
     }
+    Ok(base)
+}
+
+/// Bearer tokens and passphrase sessions may only travel over HTTPS or loopback HTTP.
+pub(crate) fn require_secure_credential_transport(url: &Url) -> Result<(), DaemonClientError> {
+    if url.scheme() == "http" && !is_loopback_url(url) {
+        return Err(DaemonClientError::InsecureCredentialTransport);
+    }
+    Ok(())
+}
+
+/// The builder for every native request that may carry daemon credentials. Redirects are
+/// never followed, and a loopback destination ignores ambient proxy settings and resolves
+/// `localhost` to loopback addresses only, so it cannot leave the machine.
+pub(crate) fn credentialed_client_builder(url: &Url) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder()
+        .timeout(DEFAULT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if !is_loopback_url(url) {
+        return builder;
+    }
+    let builder = builder.no_proxy();
+    if url.host_str() == Some("localhost") {
+        builder.resolve_to_addrs(
+            "localhost",
+            &[
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+            ],
+        )
+    } else {
+        builder
+    }
+}
+
+fn sessions_url(base_url: &str) -> Result<Url, DaemonClientError> {
+    let mut base = parse_base_url(base_url)?;
     if !base.path().ends_with('/') {
         base.path_segments_mut()
             .map_err(|_| DaemonClientError::InvalidBaseUrl {

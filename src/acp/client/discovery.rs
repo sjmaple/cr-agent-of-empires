@@ -14,10 +14,9 @@ use thiserror::Error;
 
 use crate::cli::serve::{daemon_pid, read_serve_urls, ServeUrl};
 
-/// `base_url` carries no query string so it is safe to log; the token travels
-/// separately, as a bearer header in [`super::http`] and a `?token=` query in
-/// [`super::ws`].
-#[derive(Debug, Clone)]
+/// The token travels separately, as a bearer header in [`super::http`] and
+/// [`super::ws`]. `Debug` prints only the origin: a base path can itself be a secret.
+#[derive(Clone)]
 pub struct DaemonEndpoint {
     /// Bare base URL (`http://127.0.0.1:8080`), no trailing slash or query.
     pub base_url: String,
@@ -32,6 +31,18 @@ pub struct DaemonEndpoint {
     /// path to race, so a plain re-read keeps this simple.
     local_passphrase_path: Option<PathBuf>,
     pub source: Source,
+}
+
+impl std::fmt::Debug for DaemonEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let origin = reqwest::Url::parse(&self.base_url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "<invalid>".to_string());
+        f.debug_struct("DaemonEndpoint")
+            .field("origin", &origin)
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonEndpoint {

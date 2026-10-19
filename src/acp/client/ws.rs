@@ -3,9 +3,9 @@
 //! Subscribes to `/sessions/{id}/acp/ws?since=N` and yields decoded events.
 //! `parse_text` documents the frame shapes the daemon pushes.
 //!
-//! The bearer token rides a `?token=` query param rather than a header, which
-//! most WS clients do not surface cleanly; the daemon's auth middleware accepts
-//! both. Only the redacted URL is ever logged.
+//! The bearer token rides an `Authorization` header, never the URL. The daemon's
+//! auth middleware still accepts a `?token=` query for browsers, which cannot set
+//! headers on a WebSocket.
 //!
 //! A `--auth=passphrase` daemon never mints a bearer token, so when only a
 //! passphrase resolves the upgrade request instead carries `Cookie:
@@ -143,8 +143,8 @@ pub async fn connect_with(
     let url = ws_url(endpoint, session_id, since, forward_frames);
     debug!(
         target: "acp.client.ws",
-        // Log the path without the token query param.
-        url = %sanitize_for_log(&url),
+        session = %session_id,
+        since,
         "connecting to structured view ws"
     );
     let cache = PassphraseSessionCache::default();
@@ -161,66 +161,151 @@ pub async fn connect_with(
     })
 }
 
-/// Connect the WS upgrade, retrying once after a fresh passphrase login if a
-/// *cached* session was rejected (rotated passphrase, expired or evicted
-/// session). A first-ever login failure is not retried: the passphrase
-/// itself is wrong, not merely stale.
+/// Connect the WS upgrade, retrying once after a fresh passphrase login if a *cached*
+/// session was rejected (rotated passphrase, expired or evicted session), or if a bearer
+/// token alone was refused and a passphrase resolves (a daemon that also requires the
+/// second factor). A first-ever login failure is not retried: the credential itself is
+/// wrong.
 async fn connect_authed(
     endpoint: &DaemonEndpoint,
     url: &str,
     cache: &PassphraseSessionCache,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WsError> {
-    let had_cached_session = cache.get(endpoint).is_some();
-    let request = build_authed_request(endpoint, url, cache).await?;
-    match connect_async(request).await {
-        Ok((stream, _)) => Ok(stream),
-        Err(err) if had_cached_session && is_unauthorized(&err) => {
-            cache.invalidate(endpoint);
-            let request = build_authed_request(endpoint, url, cache).await?;
-            let (stream, _) = connect_async(request).await?;
-            Ok(stream)
-        }
-        Err(err) => Err(err.into()),
+    let (request, credential) = build_authed_request(endpoint, url, cache, false).await?;
+    match connect_pinned(request).await {
+        Err(err) if is_unauthorized(&err) => match credential {
+            Credential::Session { cached: true } => cache.invalidate(endpoint),
+            Credential::Bearer if endpoint.resolved_passphrase().is_some() => {}
+            _ => return Err(err.into()),
+        },
+        result => return Ok(result?),
+    }
+    let (request, _) = build_authed_request(endpoint, url, cache, true).await?;
+    Ok(connect_pinned(request).await?)
+}
+
+/// A handshake rejection keeps its status and headers but not a body, which a server
+/// could use to reflect credentials into an error message.
+fn without_response_body(
+    error: tokio_tungstenite::tungstenite::Error,
+) -> tokio_tungstenite::tungstenite::Error {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(response) => Error::Http(Box::new(response.map(|_| None))),
+        error => error,
     }
 }
 
-/// Build the WS upgrade request. A resolved bearer token already rides the
-/// URL (see [`ws_url`]); a passphrase instead needs the login session's
-/// `aoe_session` cookie and device-binding secret attached as headers,
-/// logging in on first use.
+async fn connect_pinned(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Error> {
+    connect_loopback_pinned(request)
+        .await
+        .map_err(without_response_body)
+}
+
+/// `localhost` connects to loopback addresses only, never whatever the resolver returns.
+/// Redirects are not followed and no proxy is used.
+async fn connect_loopback_pinned(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Error> {
+    use tokio_tungstenite::tungstenite::Error;
+    let uri = request.uri().clone();
+    if uri.host() != Some("localhost") {
+        return Ok(connect_async(request).await?.0);
+    }
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let loopback = [
+        std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+    ];
+    let stream = TcpStream::connect(&loopback[..]).await.map_err(Error::Io)?;
+    Ok(
+        tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
+            .await?
+            .0,
+    )
+}
+
+/// Which credential the upgrade request carries.
+enum Credential {
+    None,
+    Bearer,
+    /// `cached` is false when this call performed the login.
+    Session {
+        cached: bool,
+    },
+}
+
+/// Build the WS upgrade request. A cached passphrase-login session wins over a bearer
+/// token; otherwise a resolved token rides an `Authorization` header, else a passphrase
+/// attaches the login session's `aoe_session` cookie and device-binding secret, logging in
+/// on first use. `force_session` skips the bearer. Refuses before any connection when the
+/// transport would expose the credential.
 async fn build_authed_request(
     endpoint: &DaemonEndpoint,
     url: &str,
     cache: &PassphraseSessionCache,
-) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, WsError> {
+    force_session: bool,
+) -> Result<
+    (
+        tokio_tungstenite::tungstenite::http::Request<()>,
+        Credential,
+    ),
+    WsError,
+> {
     let mut request = url
         .into_client_request()
         .map_err(|e| WsError::InvalidUrl(e.to_string()))?;
-    if endpoint.resolved_token().is_none() && endpoint.resolved_passphrase().is_some() {
-        let session = match cache.get(endpoint) {
-            Some(session) => session,
-            None => passphrase_session::login(endpoint, cache).await?,
-        };
-        request.headers_mut().insert(
-            tokio_tungstenite::tungstenite::http::header::COOKIE,
-            session
-                .cookie
-                .parse()
-                .map_err(|_| WsError::InvalidUrl("invalid session cookie".to_string()))?,
-        );
-        // `aoe-auth` must be offered too: the daemon only echoes a
-        // `Sec-WebSocket-Protocol` response header when the client offered
-        // that exact literal, and tungstenite hard-fails the handshake
-        // (`NoSubProtocol`) if the response omits it while the request
-        // carried one. See the module doc comment.
-        request.headers_mut().insert(
-            tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
-            format!("aoe-auth, aoe-device.{}", session.binding_secret)
-                .parse()
-                .map_err(|_| WsError::InvalidUrl("invalid device binding secret".to_string()))?,
-        );
+    let token = endpoint.resolved_token();
+    let has_passphrase = endpoint.resolved_passphrase().is_some();
+    let cached = has_passphrase && cache.get(endpoint).is_some();
+    if token.is_none() && !has_passphrase {
+        return Ok((request, Credential::None));
     }
-    Ok(request)
+    let base = crate::daemon::parse_base_url(&endpoint.base_url).map_err(HttpError::from)?;
+    crate::daemon::require_secure_credential_transport(&base).map_err(HttpError::from)?;
+    if let Some(token) = token.filter(|_| !(has_passphrase && (force_session || cached))) {
+        let mut value: tokio_tungstenite::tungstenite::http::HeaderValue =
+            format!("Bearer {token}")
+                .parse()
+                .map_err(|_| WsError::InvalidUrl("invalid bearer token".to_string()))?;
+        value.set_sensitive(true);
+        request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+            value,
+        );
+        return Ok((request, Credential::Bearer));
+    }
+    let session = match cache.get(endpoint) {
+        Some(session) => session,
+        None => passphrase_session::login(endpoint, cache).await?,
+    };
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::COOKIE,
+        session
+            .cookie
+            .parse()
+            .map_err(|_| WsError::InvalidUrl("invalid session cookie".to_string()))?,
+    );
+    // `aoe-auth` must be offered too: the daemon only echoes a
+    // `Sec-WebSocket-Protocol` response header when the client offered
+    // that exact literal, and tungstenite hard-fails the handshake
+    // (`NoSubProtocol`) if the response omits it while the request
+    // carried one. See the module doc comment.
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+        format!("aoe-auth, aoe-device.{}", session.binding_secret)
+            .parse()
+            .map_err(|_| WsError::InvalidUrl("invalid device binding secret".to_string()))?,
+    );
+    Ok((request, Credential::Session { cached }))
 }
 
 fn is_unauthorized(err: &tokio_tungstenite::tungstenite::Error) -> bool {
@@ -377,23 +462,10 @@ fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64, forward_frame
     if !forward_frames {
         params.push("frames=0".to_string());
     }
-    if let Some(token) = endpoint.resolved_token() {
-        params.push(format!("token={token}"));
-    }
     if params.is_empty() {
         format!("{base}{path}")
     } else {
         format!("{base}{path}?{}", params.join("&"))
-    }
-}
-
-fn sanitize_for_log(url: &str) -> String {
-    let Some((head, tail)) = url.split_once("token=") else {
-        return url.to_string();
-    };
-    match tail.split_once('&') {
-        Some((_, rest)) => format!("{head}token=<redacted>&{rest}"),
-        None => format!("{head}token=<redacted>"),
     }
 }
 
@@ -406,53 +478,26 @@ mod tests {
         DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
     }
 
-    /// `since=0` is omitted, `frames=0` marks a projections-only consumer, and
-    /// an https endpoint upgrades to `wss`.
+    /// `since=0` is omitted, `frames=0` marks a projections-only consumer, an https
+    /// endpoint upgrades to `wss`, and the URL never carries the token.
     #[test]
     fn ws_url_query_shape() {
         let e = endpoint("http://127.0.0.1:8080", Some("abc"));
         for (since, frames, want) in [
-            (
-                42,
-                true,
-                "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&token=abc",
-            ),
+            (42, true, "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42"),
             (
                 42,
                 false,
-                "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&frames=0&token=abc",
+                "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&frames=0",
             ),
-            (0, true, "ws://127.0.0.1:8080/sessions/s-1/acp/ws?token=abc"),
+            (0, true, "ws://127.0.0.1:8080/sessions/s-1/acp/ws"),
         ] {
             assert_eq!(ws_url(&e, "s-1", since, frames), want);
         }
-        assert_eq!(
-            ws_url(&endpoint("http://127.0.0.1:8080", None), "s-1", 0, true),
-            "ws://127.0.0.1:8080/sessions/s-1/acp/ws"
-        );
         assert!(
             ws_url(&endpoint("https://remote.test", Some("t")), "s-1", 0, true)
                 .starts_with("wss://")
         );
-
-        // #3003: a local daemon's rotated token file wins over the discovered one.
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let token_path = dir.path().join("serve.token");
-            let rotated = "b".repeat(64);
-            std::fs::write(&token_path, &rotated).unwrap();
-            let endpoint = DaemonEndpoint::new(
-                "http://127.0.0.1:8080".into(),
-                Some("a".repeat(64)),
-                Source::LocalDaemon,
-            )
-            .with_local_token_path(token_path);
-
-            assert_eq!(
-                ws_url(&endpoint, "s-1", 0, true),
-                format!("ws://127.0.0.1:8080/sessions/s-1/acp/ws?token={rotated}")
-            );
-        }
     }
 
     /// Any present `kind` marks a control frame, whatever its JSON type, and
@@ -539,21 +584,89 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn build_authed_request_adds_no_headers_when_bearer_token_resolves() {
+    async fn build_authed_request_sends_the_bearer_token_as_a_sensitive_header() {
         let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         let e = endpoint("http://127.0.0.1:8080", Some("tok"));
         let cache = PassphraseSessionCache::default();
-        let request = build_authed_request(&e, "ws://127.0.0.1:8080/sessions/s-1/acp/ws", &cache)
-            .await
+        let request =
+            build_authed_request(&e, "ws://127.0.0.1:8080/sessions/s-1/acp/ws", &cache, false)
+                .await
+                .unwrap()
+                .0;
+        let authorization = request
+            .headers()
+            .get(tokio_tungstenite::tungstenite::http::header::AUTHORIZATION)
             .unwrap();
+        assert_eq!(authorization, "Bearer tok");
+        assert!(authorization.is_sensitive());
+        assert!(request.uri().query().is_none());
         assert!(request
             .headers()
             .get(tokio_tungstenite::tungstenite::http::header::COOKIE)
             .is_none());
-        assert!(request
-            .headers()
-            .get(tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL)
-            .is_none());
+    }
+
+    /// #3003: a local daemon's rotated token file wins over the discovered one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_authed_request_uses_the_rotated_local_token() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("serve.token");
+        let rotated = "b".repeat(64);
+        std::fs::write(&token_path, &rotated).unwrap();
+        let e = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            Some("a".repeat(64)),
+            Source::LocalDaemon,
+        )
+        .with_local_token_path(token_path);
+        let request = build_authed_request(
+            &e,
+            "ws://127.0.0.1:8080/sessions/s-1/acp/ws",
+            &PassphraseSessionCache::default(),
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            request
+                .headers()
+                .get(tokio_tungstenite::tungstenite::http::header::AUTHORIZATION)
+                .unwrap(),
+            format!("Bearer {rotated}").as_str()
+        );
+    }
+
+    /// A credential never reaches a plaintext remote endpoint: the request is refused
+    /// before any connection is attempted.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_authed_request_refuses_plaintext_remote_credentials() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let e = endpoint("http://203.0.113.9:8080", Some("tok"));
+        let result = build_authed_request(
+            &e,
+            "ws://203.0.113.9:8080/sessions/s-1/acp/ws",
+            &PassphraseSessionCache::default(),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(WsError::Auth(HttpError::Daemon(
+                crate::daemon::DaemonClientError::InsecureCredentialTransport
+            )))
+        ));
+        assert!(build_authed_request(
+            &endpoint("https://203.0.113.9", Some("tok")),
+            "wss://203.0.113.9/sessions/s-1/acp/ws",
+            &PassphraseSessionCache::default(),
+            false,
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -562,9 +675,11 @@ mod tests {
         let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         let e = endpoint("http://127.0.0.1:8080", None);
         let cache = PassphraseSessionCache::default();
-        let request = build_authed_request(&e, "ws://127.0.0.1:8080/sessions/s-1/acp/ws", &cache)
-            .await
-            .unwrap();
+        let request =
+            build_authed_request(&e, "ws://127.0.0.1:8080/sessions/s-1/acp/ws", &cache, false)
+                .await
+                .unwrap()
+                .0;
         assert!(request
             .headers()
             .get(tokio_tungstenite::tungstenite::http::header::COOKIE)
@@ -586,9 +701,11 @@ mod tests {
             binding_secret: "the-binding-secret".to_string(),
         });
 
-        let request = build_authed_request(&e, "ws://127.0.0.1:8080/sessions/s-1/acp/ws", &cache)
-            .await
-            .unwrap();
+        let request =
+            build_authed_request(&e, "ws://127.0.0.1:8080/sessions/s-1/acp/ws", &cache, false)
+                .await
+                .unwrap()
+                .0;
         assert_eq!(
             request
                 .headers()
@@ -625,17 +742,5 @@ mod tests {
             .unwrap();
         assert!(!is_unauthorized(&TError::Http(Box::new(forbidden))));
         assert!(!is_unauthorized(&TError::ConnectionClosed));
-    }
-
-    #[test]
-    fn sanitize_for_log_redacts_token() {
-        assert_eq!(
-            sanitize_for_log("ws://127.0.0.1/path?since=1&token=secret"),
-            "ws://127.0.0.1/path?since=1&token=<redacted>"
-        );
-        assert_eq!(
-            sanitize_for_log("ws://127.0.0.1/path?token=secret&since=1"),
-            "ws://127.0.0.1/path?token=<redacted>&since=1"
-        );
     }
 }
