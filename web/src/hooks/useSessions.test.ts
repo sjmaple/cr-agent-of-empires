@@ -60,4 +60,40 @@ describe("useSessions / out-of-order responses", () => {
     await act(async () => resolvers[0]!(envelope("old")));
     expect(result.current.sessions.map((s) => s.id)).toEqual(["new"]);
   });
+
+  it("keeps a pushed status over a poll that began before the push, then yields to a later poll", async () => {
+    vi.useFakeTimers();
+    const resolvers: ((value: api.SessionsEnvelope | null) => void)[] = [];
+    vi.spyOn(api, "fetchSessions").mockImplementation(() => new Promise((r) => resolvers.push(r)));
+    const envelope = (status: SessionResponse["status"]): api.SessionsEnvelope => ({
+      sessions: [{ id: "a", status } as SessionResponse],
+      workspace_ordering: [],
+    });
+
+    const { result } = renderHook(() => useSessions());
+    await act(async () => resolvers[0]!(envelope("Running")));
+    act(() => result.current.applyPushedStatus("a", "Waiting"));
+    expect(result.current.sessions[0]!.status).toBe("Waiting");
+
+    act(() => result.current.refresh());
+    await act(async () => resolvers[1]!(envelope("Running")));
+    expect(result.current.sessions[0]!.status).toBe("Running");
+  });
+
+  it("holds a pushed status against a stale in-flight poll", async () => {
+    vi.useFakeTimers();
+    const resolvers: ((value: api.SessionsEnvelope | null) => void)[] = [];
+    vi.spyOn(api, "fetchSessions").mockImplementation(() => new Promise((r) => resolvers.push(r)));
+    const envelope = (status: SessionResponse["status"]): api.SessionsEnvelope => ({
+      sessions: [{ id: "a", status } as SessionResponse],
+      workspace_ordering: [],
+    });
+
+    const { result } = renderHook(() => useSessions());
+    await act(async () => resolvers[0]!(envelope("Running")));
+    act(() => result.current.refresh()); // in flight when the push lands
+    act(() => result.current.applyPushedStatus("a", "Waiting"));
+    await act(async () => resolvers[1]!(envelope("Running")));
+    expect(result.current.sessions[0]!.status).toBe("Waiting");
+  });
 });

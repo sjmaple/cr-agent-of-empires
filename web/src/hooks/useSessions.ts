@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionResponse } from "../lib/types";
 import { fetchSessions, type SessionsEnvelope } from "../lib/api";
 import { setServerDown } from "../lib/connectionState";
-import { beginRead, markReadApplied } from "../lib/sessionReads";
+import { beginRead, markReadApplied, startedReads } from "../lib/sessionReads";
 
 const POLL_INTERVAL = 3000;
 const LOCAL_ORDERING_WINDOW_MS = 4000;
@@ -16,6 +16,8 @@ export function useSessions() {
   const lastReadRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastLocalOrderingAtRef = useRef<number>(0);
+  // Pushed statuses by id, with the newest read begun at push time; reads at or below it predate the push.
+  const pushedRef = useRef(new Map<string, { status: SessionResponse["status"]; read: number }>());
 
   const injectSession = useCallback((session: SessionResponse) => {
     // Single-session responses omit rate-limit fields; keep the last known values (#3514).
@@ -33,7 +35,18 @@ export function useSessions() {
     if (data !== null) {
       if (read < lastReadRef.current) return;
       lastReadRef.current = read;
-      setSessions(data.sessions);
+      const pushed = pushedRef.current;
+      setSessions(
+        data.sessions.map((s) => {
+          const p = pushed.get(s.id);
+          if (!p) return s;
+          if (read > p.read) {
+            pushed.delete(s.id);
+            return s;
+          }
+          return { ...s, status: p.status };
+        }),
+      );
       setAppliedRead(read);
       // Ignore server ordering while a local drag's PUT may still be landing.
       if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
@@ -54,17 +67,23 @@ export function useSessions() {
     if (appliedRead) markReadApplied(appliedRead);
   }, [appliedRead]);
 
+  const refresh = useCallback(() => {
+    const read = beginRead();
+    void fetchSessions().then((data) => applyResult(data, read));
+  }, [applyResult]);
+
   useEffect(() => {
-    const poll = () => {
-      const read = beginRead();
-      void fetchSessions().then((data) => applyResult(data, read));
-    };
-    poll();
-    intervalRef.current = setInterval(poll, POLL_INTERVAL);
+    refresh();
+    intervalRef.current = setInterval(refresh, POLL_INTERVAL);
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [applyResult]);
+  }, [refresh]);
+
+  const applyPushedStatus = useCallback((id: string, status: SessionResponse["status"]) => {
+    pushedRef.current.set(id, { status, read: startedReads() });
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)));
+  }, []);
 
   const setSessionStatus = useCallback((id: string, status: SessionResponse["status"]) => {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)));
@@ -94,5 +113,7 @@ export function useSessions() {
     injectSession,
     setSessionStatus,
     applySession,
+    refresh,
+    applyPushedStatus,
   };
 }
