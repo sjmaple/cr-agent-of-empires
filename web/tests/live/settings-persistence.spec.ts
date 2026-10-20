@@ -3,19 +3,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
-import {
-  test,
-  expect,
-  authHeaders,
-  bootDashboard,
-  type ServeHandle,
-} from "../helpers/liveTest";
-import {
-  appDirFor,
-  loginWithPassphrase,
-  resolveAoeBinary,
-  spawnAoeServe,
-} from "../helpers/aoeServe";
+import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import { appDirFor, loginWithPassphrase, resolveAoeBinary, spawnAoeServe } from "../helpers/aoeServe";
 
 // #1189: the theme resolver once deadlocked per request, which mocked specs cannot see.
 test.describe("theme API", () => {
@@ -39,14 +28,7 @@ test.describe("theme API", () => {
   };
 
   test("GET /api/themes/:name handles all 6 builtins sequentially without hanging", async () => {
-    for (const name of [
-      "empire",
-      "phosphor",
-      "tokyo-night-storm",
-      "catppuccin-latte",
-      "dracula",
-      "rose-pine",
-    ]) {
+    for (const name of ["empire", "phosphor", "tokyo-night-storm", "catppuccin-latte", "dracula", "rose-pine"]) {
       const body = await fetchTheme(name);
       expect(body.name).toBe(name);
       expect(body.web.cssVars).toBeTruthy();
@@ -58,11 +40,8 @@ const DRACULA_SURFACE = "#282a36";
 const labelledSelect = (page: Page, label: RegExp) =>
   page.locator("label", { hasText: label }).locator("..").locator("select");
 const getJson = (url: string, handle?: ServeHandle) =>
-  fetch(url, { headers: handle ? authHeaders(handle) : {} }).then((r) =>
-    r.json(),
-  );
-const readInPage = (page: Page, url: string) =>
-  page.evaluate(async (u) => (await fetch(u)).json(), url);
+  fetch(url, { headers: handle ? authHeaders(handle) : {} }).then((r) => r.json());
+const readInPage = (page: Page, url: string) => page.evaluate(async (u) => (await fetch(u)).json(), url);
 const confirmPassphraseDialog = (page: Page) =>
   page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i });
 
@@ -71,19 +50,14 @@ async function defaultProfile(handle: ServeHandle): Promise<string> {
     `${handle.baseUrl}/api/profiles`,
     handle,
   );
-  return (
-    profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main"
-  );
+  return profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
 }
 
 async function pickDracula(select: Locator) {
   await expect(select).toBeVisible({ timeout: 10_000 });
   await expect
     .poll(
-      () =>
-        select.evaluate((sel: HTMLSelectElement) =>
-          Array.from(sel.options).some((o) => o.value === "dracula"),
-        ),
+      () => select.evaluate((sel: HTMLSelectElement) => Array.from(sel.options).some((o) => o.value === "dracula")),
       { timeout: 5_000 },
     )
     .toBe(true);
@@ -92,33 +66,18 @@ async function pickDracula(select: Locator) {
 
 async function expectRepaint(page: Page) {
   await expect
-    .poll(
-      () =>
-        page.evaluate(() =>
-          document.documentElement.style
-            .getPropertyValue("--color-surface-900")
-            .trim(),
-        ),
-      {
-        timeout: 5_000,
-        intervals: [100, 200, 400],
-      },
-    )
+    .poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue("--color-surface-900").trim()), {
+      timeout: 5_000,
+      intervals: [100, 200, 400],
+    })
     .toBe(DRACULA_SURFACE);
 }
 
-test("structured view settings persist through PATCH + reload, node_path is stripped", async ({
-  serve,
-  page,
-}) => {
+test("structured view settings persist through PATCH + reload, node_path is stripped", async ({ serve, page }) => {
   // #1689: the section was missing from the allowlist. node_path is a local-only RCE surface.
   const settingsUrl = `${serve.baseUrl}/api/settings`;
-  const baselineAcp = ((await getJson(settingsUrl))?.acp ?? {}) as Record<
-    string,
-    unknown
-  >;
-  const baselineNodePath =
-    typeof baselineAcp.node_path === "string" ? baselineAcp.node_path : "";
+  const baselineAcp = ((await getJson(settingsUrl))?.acp ?? {}) as Record<string, unknown>;
+  const baselineNodePath = typeof baselineAcp.node_path === "string" ? baselineAcp.node_path : "";
   const newIdle = baselineAcp.auto_stop_idle_secs === 28800 ? 14400 : 28800;
 
   const patchRes = await fetch(settingsUrl, {
@@ -144,10 +103,7 @@ test("structured view settings persist through PATCH + reload, node_path is stri
   expect(fetched?.acp?.node_path).not.toBe("/tmp/evil-node");
 });
 
-test("theme picker repaints, persists across reload and serve restart (#1510)", async ({
-  serve,
-  page,
-}) => {
+test("theme picker repaints, persists across reload and serve restart (#1510)", async ({ serve, page }) => {
   // The picker writes the global /api/theme endpoint and must dispatch its repaint only after the write.
   const settingsUrl = `${serve.baseUrl}/api/settings`;
   await page.goto(`${serve.baseUrl}/settings/theme`);
@@ -166,10 +122,7 @@ test("theme picker repaints, persists across reload and serve restart (#1510)", 
 
 // #1510: a passphrase session is authenticated but not elevated.
 test.describe("passphrase mode", () => {
-  test("theme picker persists across reload + restart without passphrase prompt", async ({
-    servePreauthed,
-    page,
-  }) => {
+  test("theme picker persists across reload + restart without passphrase prompt", async ({ servePreauthed, page }) => {
     const settingsUrl = `${servePreauthed.baseUrl}/api/settings`;
     await bootDashboard(page, servePreauthed, "/settings/theme");
     await page.evaluate(() => {
@@ -182,30 +135,19 @@ test.describe("passphrase mode", () => {
 
     await pickDracula(labelledSelect(page, /^Theme$/));
     await expect(async () => {
-      expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe(
-        "dracula",
-      );
+      expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
     }).toPass({ timeout: 5_000 });
     await expect(confirmPassphraseDialog(page)).toHaveCount(0);
     expect(
-      await page.evaluate(
-        () =>
-          (window as unknown as { __elevationFired?: boolean })
-            .__elevationFired ?? false,
-      ),
+      await page.evaluate(() => (window as unknown as { __elevationFired?: boolean }).__elevationFired ?? false),
     ).toBe(false);
     await expectRepaint(page);
 
     await Promise.all([
-      page.waitForResponse(
-        (res) => res.url().endsWith("/api/about") && res.status() === 200,
-        { timeout: 10_000 },
-      ),
+      page.waitForResponse((res) => res.url().endsWith("/api/about") && res.status() === 200, { timeout: 10_000 }),
       page.reload(),
     ]);
-    expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe(
-      "dracula",
-    );
+    expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
 
     await servePreauthed.restart();
     const { cookie } = await loginWithPassphrase(
@@ -214,9 +156,7 @@ test.describe("passphrase mode", () => {
       servePreauthed.deviceBindingSecret!,
     );
     servePreauthed.sessionCookie = cookie;
-    expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe(
-      "dracula",
-    );
+    expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
   });
 
   test("sandbox image change needs no elevation for loopback and ignores a forged X-Forwarded-For", async ({
@@ -232,48 +172,33 @@ test.describe("passphrase mode", () => {
       page.evaluate(
         async ({ profile, image, xff }) =>
           (
-            await fetch(
-              `/api/profiles/${encodeURIComponent(profile)}/settings`,
-              {
-                method: "PATCH",
-                headers: {
-                  "Content-Type": "application/json",
-                  ...(xff ? { "X-Forwarded-For": xff } : {}),
-                },
-                body: JSON.stringify({ sandbox: { default_image: image } }),
+            await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
+              method: "PATCH",
+              headers: {
+                "Content-Type": "application/json",
+                ...(xff ? { "X-Forwarded-For": xff } : {}),
               },
-            )
+              body: JSON.stringify({ sandbox: { default_image: image } }),
+            })
           ).status,
         { profile, image, xff },
       );
 
     expect(await patchImage("ghcr.io/example/img:local-trusted")).toBe(200);
-    expect(
-      await patchImage("ghcr.io/example/img:forged-xff", "203.0.113.10"),
-    ).toBe(200);
+    expect(await patchImage("ghcr.io/example/img:forged-xff", "203.0.113.10")).toBe(200);
     await expect(confirmPassphraseDialog(page)).toHaveCount(0);
   });
 });
 
-test("global settings migrate from profiles and reject stale profile writes", async ({
-  spawnServe,
-  page,
-}) => {
+test("global settings migrate from profiles and reject stale profile writes", async ({ spawnServe, page }) => {
   let appDir = "";
   const serve = await spawnServe({
     seedFn: ({ home, xdg }) => {
       appDir = appDirFor(home, xdg, resolveAoeBinary());
       writeFileSync(join(appDir, ".schema_version"), "29");
-      writeFileSync(
-        join(appDir, "config.toml"),
-        "default_profile = 'work'\n[theme]\nname = 'empire'\n",
-      );
-      for (const name of ["alpha", "work"])
-        mkdirSync(join(appDir, "profiles", name), { recursive: true });
-      writeFileSync(
-        join(appDir, "profiles", "alpha", "config.toml"),
-        "[theme]\nname = 'rose-pine'\n",
-      );
+      writeFileSync(join(appDir, "config.toml"), "default_profile = 'work'\n[theme]\nname = 'empire'\n");
+      for (const name of ["alpha", "work"]) mkdirSync(join(appDir, "profiles", name), { recursive: true });
+      writeFileSync(join(appDir, "profiles", "alpha", "config.toml"), "[theme]\nname = 'rose-pine'\n");
       writeFileSync(
         join(appDir, "profiles", "work", "config.toml"),
         "[theme]\nname = 'dracula'\nidle_decay_minutes = 5\n[session]\nsidebar_position = 'left'\nconfirm_before_quit = false\nsession_id_poller_max_threads = 12\ndefault_tool = 'codex'\n[web]\nnotify_on_idle = true\n",
@@ -290,10 +215,7 @@ test("global settings migrate from profiles and reject stale profile writes", as
   expect(migrated.session.confirm_before_quit).toBe(false);
   expect(migrated.session.session_id_poller_max_threads).toBe(12);
   expect(migrated.web.notify_on_idle).toBe(true);
-  const profileBefore = readFileSync(
-    join(appDir, "profiles", "work", "config.toml"),
-    "utf8",
-  );
+  const profileBefore = readFileSync(join(appDir, "profiles", "work", "config.toml"), "utf8");
   expect(profileBefore).not.toContain("sidebar_position");
   expect(profileBefore).not.toContain("confirm_before_quit");
   const staleOverride = await fetch(profileUrl, {
@@ -304,12 +226,8 @@ test("global settings migrate from profiles and reject stale profile writes", as
     }),
   });
   expect(staleOverride.status).toBe(400);
-  expect((await staleOverride.json()).message).toContain(
-    "session.sidebar_position",
-  );
-  expect(
-    readFileSync(join(appDir, "profiles", "work", "config.toml"), "utf8"),
-  ).toBe(profileBefore);
+  expect((await staleOverride.json()).message).toContain("session.sidebar_position");
+  expect(readFileSync(join(appDir, "profiles", "work", "config.toml"), "utf8")).toBe(profileBefore);
   const logUrl = `${serve.baseUrl}/api/log-level`;
   const runtimeLog = await fetch(logUrl, {
     method: "PATCH",
@@ -326,9 +244,7 @@ test("global settings migrate from profiles and reject stale profile writes", as
   await expect(position).toHaveValue("left");
   const [saveResponse] = await Promise.all([
     page.waitForResponse(
-      (response) =>
-        response.url().startsWith(settingsUrl) &&
-        response.request().method() === "PATCH",
+      (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
     ),
     position.selectOption("right"),
   ]);
@@ -354,35 +270,25 @@ test("global settings migrate from profiles and reject stale profile writes", as
   expect(persisted.session.sidebar_position).toBe("right");
 });
 
-test("shortcut bar toggle persists globally from Terminal UI settings", async ({
-  serve,
-  page,
-}) => {
+test("shortcut bar toggle persists globally from Terminal UI settings", async ({ serve, page }) => {
   const profile = await defaultProfile(serve);
   const settingsUrl = `${serve.baseUrl}/api/settings`;
   const machineUrl = `${settingsUrl}?layer=machine`;
   const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`;
-  const toggle = page
-    .getByText("Show shortcut bar", { exact: true })
-    .locator("../..")
-    .getByRole("switch");
+  const toggle = page.getByText("Show shortcut bar", { exact: true }).locator("../..").getByRole("switch");
 
   await page.goto(`${serve.baseUrl}/settings/session`);
   await page.getByRole("button", { name: /Terminal UI/ }).click();
   await expect(toggle).toBeChecked();
   const [saved] = await Promise.all([
     page.waitForResponse(
-      (response) =>
-        response.url().startsWith(settingsUrl) &&
-        response.request().method() === "PATCH",
+      (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
     ),
     toggle.click(),
   ]);
   expect(saved.ok()).toBe(true);
   expect((await getJson(machineUrl)).session.show_shortcut_bar).toBe(false);
-  expect(
-    (await getJson(profileUrl)).session?.show_shortcut_bar,
-  ).toBeUndefined();
+  expect((await getJson(profileUrl)).session?.show_shortcut_bar).toBeUndefined();
   const rejected = await fetch(profileUrl, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -395,24 +301,17 @@ test("shortcut bar toggle persists globally from Terminal UI settings", async ({
   await page.getByRole("button", { name: /Terminal UI/ }).click();
   await expect(toggle).not.toBeChecked();
   await toggle.click();
-  await expect
-    .poll(async () => (await getJson(machineUrl)).session.show_shortcut_bar)
-    .toBe(true);
+  await expect.poll(async () => (await getJson(machineUrl)).session.show_shortcut_bar).toBe(true);
 });
 
-test("runtime logging overrides persist and clearing one preserves the other", async ({
-  serve,
-  page,
-}) => {
+test("runtime logging overrides persist and clearing one preserves the other", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/logging`);
   const uds = labelledSelect(page, /^runtime\.uds$/);
   const ws = labelledSelect(page, /^runtime\.ws$/);
   await expect(uds).toBeVisible();
   await uds.selectOption("warn");
   const globalUrl = `${serve.baseUrl}/api/settings`;
-  await expect
-    .poll(async () => (await getJson(globalUrl)).logging.targets["runtime.uds"])
-    .toBe("warn");
+  await expect.poll(async () => (await getJson(globalUrl)).logging.targets["runtime.uds"]).toBe("warn");
   await ws.selectOption("debug");
   await expect
     .poll(async () => (await getJson(globalUrl)).logging.targets)
@@ -422,33 +321,25 @@ test("runtime logging overrides persist and clearing one preserves the other", a
   await expect(ws).toHaveValue("debug");
 
   await ws.selectOption("");
-  await expect
-    .poll(async () => (await getJson(globalUrl)).logging.targets)
-    .toEqual({ "runtime.uds": "warn" });
+  await expect.poll(async () => (await getJson(globalUrl)).logging.targets).toEqual({ "runtime.uds": "warn" });
   await serve.restart();
   await page.reload();
   await expect(uds).toHaveValue("warn");
   await expect(ws).toHaveValue("");
 });
 
-test("systemd settings save machine-wide and refuse an invalid slice", async ({
-  serve,
-  page,
-}) => {
+test("systemd settings save machine-wide and refuse an invalid slice", async ({ serve, page }) => {
   const settingsUrl = `${serve.baseUrl}/api/settings`;
   const machineUrl = `${settingsUrl}?layer=machine`;
   const savePatch = () =>
     page.waitForResponse(
-      (response) =>
-        response.url().startsWith(settingsUrl) &&
-        response.request().method() === "PATCH",
+      (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
     );
   const slice = page
     .locator("label", { hasText: /^Systemd slice$/ })
     .locator("..")
     .locator("input");
-  const toggle = (label: string) =>
-    page.getByText(label, { exact: true }).locator("../..").getByRole("switch");
+  const toggle = (label: string) => page.getByText(label, { exact: true }).locator("../..").getByRole("switch");
   // The harness seeds `enabled = false`, so the spec never turns real scopes on.
   const enabled = toggle("Use systemd scopes");
   const survive = toggle("Sessions survive daemon restart");
