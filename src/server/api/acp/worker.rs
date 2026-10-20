@@ -456,7 +456,7 @@ pub async fn switch_acp_agent(
     )
     .await
     {
-        return persist_failure_response(&state, &id, &e).await;
+        return persist_failure_response(&state, &id, "agent switch", &e).await;
     }
     state
         .telemetry_structured
