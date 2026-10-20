@@ -1266,12 +1266,6 @@ impl Storage {
             None
         };
 
-        // groups first, sessions last.
-        if let Some(buf) = groups_buf {
-            let groups_path = self.sessions_path.with_file_name("groups.json");
-            atomic_write(&groups_path, &buf)?;
-            self.file_watch.notify_local_change(&groups_path);
-        }
         #[cfg(test)]
         if self.fail_writes_for_test
             || FAILING_PROFILES_FOR_TEST
@@ -1282,6 +1276,12 @@ impl Storage {
             anyhow::bail!("injected sessions write failure");
         }
 
+        // groups first, sessions last.
+        if let Some(buf) = groups_buf {
+            let groups_path = self.sessions_path.with_file_name("groups.json");
+            atomic_write(&groups_path, &buf)?;
+            self.file_watch.notify_local_change(&groups_path);
+        }
         atomic_write(&self.sessions_path, &instances_buf)?;
         self.file_watch.notify_local_change(&self.sessions_path);
         Ok(result)
