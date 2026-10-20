@@ -18,7 +18,7 @@ use reqwest::header::{self, HeaderMap};
 use reqwest::StatusCode;
 
 use super::discovery::DaemonEndpoint;
-use super::http::HttpError;
+use super::http::{classify_error, HttpError, Scope};
 
 const DEVICE_BINDING_FILENAME: &str = "cli_device_binding";
 const SESSION_COOKIE_FILENAME: &str = "cli_login_session";
@@ -105,7 +105,7 @@ pub(crate) async fn login(
     let res = request.send().await?;
     let status = res.status();
     if !status.is_success() {
-        return Err(map_auth_error(status));
+        return Err(map_auth_error(status, res.headers()));
     }
     let cookie = extract_session_cookie(res.headers()).ok_or(HttpError::Unauthorized)?;
     let session = PassphraseSession {
@@ -119,13 +119,11 @@ pub(crate) async fn login(
 
 /// Map a non-success `/api/login` or `/api/login/elevate` response the same
 /// way: a wrong passphrase is `Unauthorized` (mirrors the daemon's own
-/// wording for both endpoints), anything else (rate limiting, a locked-out
-/// session) is a generic server error the caller surfaces verbatim.
-fn map_auth_error(status: StatusCode) -> HttpError {
-    match status {
-        StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
-        _ => HttpError::Server { status },
-    }
+/// wording for both endpoints), a coded refusal keeps its `AoE-Error-Code`
+/// classification, and anything else (rate limiting, a locked-out session)
+/// is a generic server error the caller surfaces verbatim.
+fn map_auth_error(status: StatusCode, headers: &HeaderMap) -> HttpError {
+    classify_error(status, headers, Scope::Global)
 }
 
 /// Confirm the passphrase again against `POST /api/login/elevate`, extending
@@ -154,7 +152,7 @@ pub(super) async fn elevate(
     if status.is_success() {
         return Ok(());
     }
-    Err(map_auth_error(status))
+    Err(map_auth_error(status, res.headers()))
 }
 
 /// Login secrets are only sent over a secure transport, never follow redirects, and never
@@ -274,6 +272,7 @@ fn open_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
+    use crate::daemon::AoeErrorCode;
 
     fn local_endpoint(dir: &std::path::Path) -> DaemonEndpoint {
         DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
@@ -479,14 +478,90 @@ mod tests {
         assert!(dir.path().join(DEVICE_BINDING_FILENAME).exists());
     }
 
+    /// Login and elevation classify from the status and one status-consistent
+    /// `AoE-Error-Code`, never the body, so a stalled body cannot delay them and a
+    /// proxy's `access_policy_denied` stays actionable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn login_and_elevate_errors_classify_from_the_safe_header_without_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env = crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "pw")]);
+        for (status, codes, expect) in [
+            (
+                "403 Forbidden",
+                &["access_policy_denied"][..],
+                "access_policy",
+            ),
+            ("403 Forbidden", &["read_only"], "read_only"),
+            ("403 Forbidden", &["read_only", "cityhall_mode"], "generic"),
+            ("404 Not Found", &["read_only"], "generic"),
+            ("403 Forbidden", &[], "generic"),
+            ("429 Too Many Requests", &[], "generic"),
+            ("401 Unauthorized", &["read_only"], "unauthorized"),
+        ] {
+            let headers: String = codes
+                .iter()
+                .map(|code| format!("AoE-Error-Code: {code}\r\n"))
+                .collect();
+            let head = format!("HTTP/1.1 {status}\r\n{headers}Content-Length: 1000000\r\n\r\n");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let head = head.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 4096];
+                        let _ = stream.read(&mut buffer).await;
+                        stream.write_all(head.as_bytes()).await.unwrap();
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+            let endpoint = DaemonEndpoint::new(base, None, Source::Env);
+            let cache = PassphraseSessionCache::default();
+            cache.set(PassphraseSession {
+                cookie: "aoe_session=s".into(),
+                binding_secret: "b".into(),
+            });
+            let deadline = std::time::Duration::from_secs(10);
+            let errors = [
+                tokio::time::timeout(
+                    deadline,
+                    login(&endpoint, &PassphraseSessionCache::default()),
+                )
+                .await
+                .expect("login waited on the error body")
+                .unwrap_err(),
+                tokio::time::timeout(deadline, elevate(&endpoint, &cache))
+                    .await
+                    .expect("elevate waited on the error body")
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                let matched = matches!(
+                    (&error, expect),
+                    (
+                        HttpError::Refused(AoeErrorCode::AccessPolicyDenied),
+                        "access_policy"
+                    ) | (HttpError::ReadOnly, "read_only")
+                        | (HttpError::Unauthorized, "unauthorized")
+                        | (HttpError::Server { .. }, "generic")
+                );
+                assert!(matched, "{status} {codes:?}: {error:?}");
+            }
+            server.abort();
+        }
+    }
+
     #[test]
     fn map_auth_error_distinguishes_unauthorized_from_generic() {
         assert!(matches!(
-            map_auth_error(StatusCode::UNAUTHORIZED),
+            map_auth_error(StatusCode::UNAUTHORIZED, &HeaderMap::new()),
             HttpError::Unauthorized
         ));
         assert!(matches!(
-            map_auth_error(StatusCode::TOO_MANY_REQUESTS),
+            map_auth_error(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new()),
             HttpError::Server { status, .. } if status == StatusCode::TOO_MANY_REQUESTS
         ));
     }

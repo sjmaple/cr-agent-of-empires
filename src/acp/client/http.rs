@@ -139,7 +139,7 @@ impl From<reqwest::Error> for HttpError {
 
 /// Which endpoint family a request belongs to, deciding what a 404 means.
 #[derive(Clone, Copy)]
-enum Scope<'a> {
+pub(super) enum Scope<'a> {
     /// A 404 is a missing session.
     Session(&'a str),
     /// Daemon-wide: a 404 is an absent route (older daemon).
@@ -830,7 +830,11 @@ async fn finish(res: reqwest::Response, scope: Scope<'_>) -> Result<reqwest::Res
 
 /// Status plus the safe `AoE-Error-Code` header decide the error. The body is never read,
 /// so a stalled or reflecting server can neither delay nor steer classification.
-fn classify_error(status: StatusCode, headers: &header::HeaderMap, scope: Scope<'_>) -> HttpError {
+pub(super) fn classify_error(
+    status: StatusCode,
+    headers: &header::HeaderMap,
+    scope: Scope<'_>,
+) -> HttpError {
     classify_coded(status, AoeErrorCode::from_response(status, headers), scope)
 }
 
