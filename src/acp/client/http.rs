@@ -692,6 +692,28 @@ impl HttpClient {
 
     /// Cheapest authenticated probe: separates a down host (transport error)
     /// from misconfigured auth (401).
+    /// The daemon's tracing filter, replaced first when `patch` is given. Returns the
+    /// response body.
+    pub async fn log_level(&self, patch: Option<&serde_json::Value>) -> Result<String, HttpError> {
+        let res = match patch {
+            None => {
+                self.send(
+                    || self.request(Method::GET, "/api/log-level"),
+                    Scope::Global,
+                )
+                .await?
+            }
+            Some(body) => {
+                self.send(
+                    || self.request(Method::PATCH, "/api/log-level").json(body),
+                    Scope::Global,
+                )
+                .await?
+            }
+        };
+        Ok(res.text().await?)
+    }
+
     pub async fn health_check(&self) -> Result<(), HttpError> {
         let res = self
             .send_authed(|| self.request(Method::GET, "/api/sessions"))
@@ -1237,6 +1259,50 @@ mod tests {
         client.list_sessions(None).await.unwrap();
         assert_eq!(daemon.logins(), 1);
         assert_eq!(daemon.list_requests().len(), 3);
+    }
+
+    /// Against the real router behind a proxy, a bearer alone is refused on a
+    /// token-plus-passphrase daemon, and the fallback login must itself carry the bearer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn log_level_falls_back_to_a_passphrase_login_on_a_real_router() {
+        use crate::server::test_support;
+        use std::sync::Arc;
+        let mut _env = test_support::RuntimeEnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        _env.bind(dir.path());
+        let phrase = "log level second factor";
+        let token = "b".repeat(64);
+        let _phrase =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+        let mut state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["127.0.0.1".into()],
+            Vec::new(),
+            Some(token.clone()),
+        );
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.login_manager = Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
+        mutable.behind_tunnel = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = test_support::build_router_for_test(state.clone());
+        let shutdown = state.shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        let client = HttpClient::new(DaemonEndpoint::new(base, Some(token), Source::Env)).unwrap();
+        let body = client.log_level(None).await.unwrap();
+        assert!(body.contains("reloadable"), "{body}");
+        assert_eq!(state.login_manager.device_snapshot(None).await.len(), 1);
+        state.shutdown.cancel();
+        server.await.unwrap();
     }
 
     /// A failed step-up must not replace the daemon's own 403 with a misleading 401.

@@ -244,7 +244,7 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
 
 /// The loopback URL when the daemon lists one, since a LAN or tailnet URL is plaintext
 /// HTTP the credential gate refuses.
-pub(crate) fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
+fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
     urls.iter()
         .find(|u| is_loopback(&u.url))
         .or_else(|| urls.first())
