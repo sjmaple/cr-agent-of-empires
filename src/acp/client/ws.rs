@@ -204,6 +204,10 @@ async fn connect_pinned(
         .map_err(without_response_body)
 }
 
+fn is_localhost_name(host: Option<&str>) -> bool {
+    host.is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+}
+
 /// `localhost` connects to loopback addresses only, never whatever the resolver returns.
 /// Redirects are not followed and no proxy is used.
 async fn connect_loopback_pinned(
@@ -211,7 +215,7 @@ async fn connect_loopback_pinned(
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Error> {
     use tokio_tungstenite::tungstenite::Error;
     let uri = request.uri().clone();
-    if uri.host() != Some("localhost") {
+    if !is_localhost_name(uri.host()) {
         return Ok(connect_async(request).await?.0);
     }
     let port = uri
@@ -473,6 +477,19 @@ fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64, forward_frame
 mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
+
+    #[test]
+    fn the_loopback_pin_matches_localhost_in_any_case() {
+        for (host, pinned) in [
+            (Some("localhost"), true),
+            (Some("LocalHost"), true),
+            (Some("localhost.example.com"), false),
+            (Some("127.0.0.1"), false),
+            (None, false),
+        ] {
+            assert_eq!(is_localhost_name(host), pinned, "{host:?}");
+        }
+    }
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
         DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
