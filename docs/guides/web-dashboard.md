@@ -53,7 +53,7 @@ aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com
 | `--host` | 127.0.0.1 | Bind address; `0.0.0.0` for LAN/VPN access |
 | `--auth` | `token` | `token` (URL token), `passphrase` (login wall only), `none` (loopback only unless `--behind-proxy`). `--no-auth` is an alias for `none` |
 | `--passphrase` | | Passphrase for the login wall, also read from `AOE_SERVE_PASSPHRASE`. Valid with `--auth=token` and `--auth=passphrase` |
-| `--behind-proxy` | off | An external proxy terminates TLS: sets `; Secure` cookies and trusts `X-Forwarded-For`, `cf-connecting-ip` and `X-Forwarded-Proto` from loopback peers, and from no one else. Spawns no tunnel and requires at least one `--allowed-host` |
+| `--behind-proxy` | off | An external proxy terminates TLS: sets `; Secure` cookies and trusts `X-Forwarded-For` and `X-Forwarded-Proto` from loopback peers, and from no one else. Spawns no tunnel and requires at least one `--allowed-host` |
 | `--dangerously-allow-plaintext-remote` | off | Accept plain HTTP from non-loopback peers instead of answering `426`; see [Security](#security) |
 | `--allowed-host` | | Extra `Host` the [DNS-rebinding gate](#dns-rebinding) accepts (repeatable) |
 | `--allowed-origin` | | Extra browser `Origin` to accept (repeatable, full `scheme://host[:port]`); only needed for a proxy on a nonstandard port |
@@ -75,7 +75,7 @@ aoe serve --host 127.0.0.1 --port 42041 \
   --behind-proxy --allowed-host aoe.example.com
 ```
 
-The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`) and `X-Forwarded-Proto: https`; aoe reads the last value of each, and only when the socket peer is loopback, so a client or misconfigured upstream cannot spoof them. A request whose client address is missing, malformed or loopback is still an outside caller. `--behind-proxy` (and `--remote`) withdraws the same-host bypass for every connection to the port, so a browser on the daemon's own host signs in with the passphrase like any other client, and the local TUI and `aoe acp` commands log in with the daemon's own `serve.passphrase`. A proxy that reaches aoe over a network instead of loopback must be tunnelled to loopback first. Add `--allowed-origin https://aoe.example.com:8443` when the proxy listens on a nonstandard port. Both flags are replayed across `aoe serve --restart`.
+The upstream must set `X-Forwarded-For` and `X-Forwarded-Proto: https` (`--remote`'s tunnel also supplies `cf-connecting-ip`, which `--behind-proxy` ignores because a generic proxy can pass a client-chosen one through); aoe reads the last value of each, and only when the socket peer is loopback, so a client or misconfigured upstream cannot spoof them. A request whose client address is missing, malformed or loopback is still an outside caller. `--behind-proxy` (and `--remote`) withdraws the same-host bypass for every connection to the port, so a browser on the daemon's own host signs in with the passphrase like any other client, and the local TUI and `aoe acp` commands log in with the daemon's own `serve.passphrase`. A proxy that reaches aoe over a network instead of loopback must be tunnelled to loopback first. Add `--allowed-origin https://aoe.example.com:8443` when the proxy listens on a nonstandard port. Both flags are replayed across `aoe serve --restart`.
 
 ### Running under systemd
 

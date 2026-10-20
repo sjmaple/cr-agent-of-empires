@@ -506,7 +506,7 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let ingress = Ingress::resolve(addr, request.headers(), state.behind_tunnel);
+    let ingress = state.ingress(addr, request.headers());
     let client_ip = ingress.client_ip;
 
     // Mark same-host callers before any auth branch so handler-side elevation gates see the

@@ -116,6 +116,7 @@ pub fn build_test_app_state_ingress(
     let inner = Arc::get_mut(&mut state).expect("fresh state is not shared");
     inner.login_manager = Arc::new(login::LoginManager::new(passphrase));
     inner.behind_tunnel = proxy_mode;
+    inner.trust_cf_header = proxy_mode;
     inner.allow_plaintext_remote = allow_plaintext_remote;
     state
 }
@@ -187,6 +188,7 @@ fn build_test_app_state_impl(
         passkey_manager: Arc::new(super::passkeys::PasskeyManager::in_memory()),
         rate_limiter: Arc::new(RateLimiter::new()),
         behind_tunnel: false,
+        trust_cf_header: false,
         // Handler tests drive requests from arbitrary peers; the 426 gate has its own tests.
         allow_plaintext_remote: true,
         auth_mode: "none",

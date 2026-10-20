@@ -32,8 +32,19 @@ pub(crate) struct Ingress {
     pub externally_secure: bool,
 }
 
+impl AppState {
+    pub(crate) fn ingress(&self, peer: SocketAddr, headers: &HeaderMap) -> Ingress {
+        Ingress::resolve(peer, headers, self.behind_tunnel, self.trust_cf_header)
+    }
+}
+
 impl Ingress {
-    pub(crate) fn resolve(peer: SocketAddr, headers: &HeaderMap, proxy_mode: bool) -> Self {
+    pub(crate) fn resolve(
+        peer: SocketAddr,
+        headers: &HeaderMap,
+        proxy_mode: bool,
+        trust_cf_header: bool,
+    ) -> Self {
         let peer_ip = peer.ip().to_canonical();
         let via_trusted_proxy = proxy_mode && peer_ip.is_loopback();
         let forwarded_proto = via_trusted_proxy
@@ -43,7 +54,7 @@ impl Ingress {
         let forwarded_plaintext = forwarded_proto.is_some() && !externally_secure;
         Self {
             client_ip: if via_trusted_proxy {
-                forwarded_client_ip(headers)
+                forwarded_client_ip(headers, trust_cf_header)
             } else {
                 peer_ip
             },
@@ -61,16 +72,16 @@ fn last_list_element<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> 
     line.rsplit(',').next().map(str::trim)
 }
 
-/// `cf-connecting-ip` when the proxy sent it, else the last `x-forwarded-for` element. A
-/// missing, repeated or malformed value is [`UNKNOWN_CLIENT`].
-fn forwarded_client_ip(headers: &HeaderMap) -> IpAddr {
+/// `cf-connecting-ip` when `trust_cf_header` and the tunnel sent it, else the last
+/// `x-forwarded-for` element. A generic reverse proxy may pass a client-chosen
+/// `cf-connecting-ip` through untouched, so it is ignored there. A missing, repeated or
+/// malformed value is [`UNKNOWN_CLIENT`].
+fn forwarded_client_ip(headers: &HeaderMap, trust_cf_header: bool) -> IpAddr {
     let mut cf = headers.get_all("cf-connecting-ip").iter();
-    let parsed = match (cf.next(), cf.next()) {
-        (Some(_), Some(_)) => None,
-        (Some(value), None) => value.to_str().ok().and_then(|v| v.trim().parse().ok()),
-        (None, _) => {
-            last_list_element(headers, "x-forwarded-for").and_then(|v| v.parse::<IpAddr>().ok())
-        }
+    let parsed = match (trust_cf_header, cf.next(), cf.next()) {
+        (true, Some(_), Some(_)) => None,
+        (true, Some(value), None) => value.to_str().ok().and_then(|v| v.trim().parse().ok()),
+        _ => last_list_element(headers, "x-forwarded-for").and_then(|v| v.parse::<IpAddr>().ok()),
     };
     parsed.unwrap_or(UNKNOWN_CLIENT)
 }
@@ -83,7 +94,7 @@ pub(super) async fn plaintext_gate(
     request: Request,
     next: Next,
 ) -> Response {
-    let ingress = Ingress::resolve(peer, request.headers(), state.behind_tunnel);
+    let ingress = state.ingress(peer, request.headers());
     if ingress.plaintext_remote && !state.allow_plaintext_remote {
         tracing::debug!(target: "http.access", peer = %peer.ip(), "rejected plaintext remote request");
         return super::api::api_error(
@@ -99,12 +110,18 @@ pub(super) async fn plaintext_gate(
 mod tests {
     use super::*;
 
+    /// `proxy_mode` also trusts `cf-connecting-ip`, as `--remote` does.
     fn resolve(peer: &str, headers: &[(&'static str, &str)], proxy_mode: bool) -> Ingress {
         let mut map = HeaderMap::new();
         for (name, value) in headers {
             map.append(*name, value.parse().unwrap());
         }
-        Ingress::resolve(SocketAddr::new(ip(peer), 4000), &map, proxy_mode)
+        Ingress::resolve(
+            SocketAddr::new(ip(peer), 4000),
+            &map,
+            proxy_mode,
+            proxy_mode,
+        )
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -193,6 +210,22 @@ mod tests {
             )
             .client_ip,
             ip("203.0.113.50")
+        );
+    }
+
+    #[test]
+    fn generic_proxy_mode_ignores_cf_connecting_ip() {
+        let peer = SocketAddr::new(ip("127.0.0.1"), 4000);
+        let mut headers = HeaderMap::new();
+        headers.append("cf-connecting-ip", "203.0.113.50".parse().unwrap());
+        assert_eq!(
+            Ingress::resolve(peer, &headers, true, false).client_ip,
+            UNKNOWN_CLIENT
+        );
+        headers.append("x-forwarded-for", "198.51.100.4".parse().unwrap());
+        assert_eq!(
+            Ingress::resolve(peer, &headers, true, false).client_ip,
+            ip("198.51.100.4")
         );
     }
 

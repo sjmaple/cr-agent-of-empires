@@ -55,8 +55,7 @@ pub struct ServeArgs {
 
     /// Mark this server as sitting behind a reverse proxy that
     /// terminates TLS upstream. Sets cookies as `; Secure` and trusts
-    /// the `X-Forwarded-For` / `cf-connecting-ip` headers from
-    /// loopback peers. Does NOT auto-spawn a tunnel (unlike --remote).
+    /// the `X-Forwarded-For` header from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote).
     /// Required when --auth=passphrase or --auth=none is combined with
     /// a non-loopback bind.
     #[arg(long)]
@@ -241,7 +240,7 @@ fn validate_auth_combination(
             "Refusing to start with --auth={} on {}.\n\
              Reduced-auth modes on a non-loopback bind require --behind-proxy,\n\
              which signals that an upstream reverse proxy terminates TLS and\n\
-             forwards the client IP via X-Forwarded-For / cf-connecting-ip.",
+             forwards the client IP via X-Forwarded-For.",
             auth_mode.as_cli_str(),
             host
         );

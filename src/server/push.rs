@@ -986,9 +986,7 @@ pub async fn subscribe(
         .unwrap_or("")
         .to_string();
 
-    let externally_secure =
-        crate::server::ingress::Ingress::resolve(peer, &headers, state.behind_tunnel)
-            .externally_secure;
+    let externally_secure = state.ingress(peer, &headers).externally_secure;
     let origin = extract_request_origin(&headers, externally_secure).unwrap_or_default();
 
     let sub = Subscription {
