@@ -58,7 +58,9 @@ fn cached_mtime(
 fn adapter_mtime(command: &str) -> Option<SystemTime> {
     cached_mtime(format!("acp:{command}"), || {
         let app_dir = crate::session::get_app_dir().ok();
-        crate::acp::acp_client::resolve_agent_command(command, app_dir.as_deref()).map(|r| r.path)
+        crate::acp::acp_client::resolve_agent_command(command, app_dir.as_deref())
+            .ok()
+            .map(|r| r.path)
     })
 }
 
