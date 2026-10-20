@@ -690,7 +690,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
-        trust_cf_header: remote,
+        trust_cf_header: tunnel_handle
+            .as_ref()
+            .is_some_and(tunnel::TunnelHandle::sets_cf_connecting_ip),
         allow_plaintext_remote,
         auth_mode,
         serve_mode,
