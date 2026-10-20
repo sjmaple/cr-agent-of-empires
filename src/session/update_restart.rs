@@ -82,11 +82,9 @@ fn environment_sets_path(entries: &[String]) -> bool {
 }
 
 /// Whether the session's launch environment may resolve the agent through a PATH other than
-/// AoE's. Fails closed when the config cannot be read.
+/// AoE's: a `PATH=` entry or any `before_session` hook. Fails closed when the config cannot be
+/// read.
 fn launch_path_overridden(inst: &Instance) -> bool {
-    if inst.pending_host_env.iter().any(|(key, _)| key == "PATH") {
-        return true;
-    }
     let key = (inst.effective_profile(), inst.project_path.clone());
     let Ok(mut guard) = LAUNCH_PATH_CACHE.lock() else {
         return true;
@@ -101,7 +99,10 @@ fn launch_path_overridden(inst: &Instance) -> bool {
         &key.0,
         std::path::Path::new(&key.1),
     )
-    .map_or(true, |config| environment_sets_path(&config.environment));
+    .map_or(true, |config| {
+        // A hook's exports are transient, so any hook may have chosen the executable.
+        environment_sets_path(&config.environment) || !config.host_hooks.before_session.is_empty()
+    });
     cache.insert(key, (Instant::now(), overridden));
     overridden
 }
@@ -239,7 +240,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn a_launch_environment_that_sets_path_is_never_offered() {
+    fn a_before_session_hook_means_the_host_binary_cannot_be_attested() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -247,14 +248,21 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut inst = Instance::new("t", temp.path().to_str().unwrap());
-        inst.status = Status::Idle;
-        inst.command = bin.to_str().unwrap().into();
-        inst.started_at = DateTime::from_timestamp(1_000, 0);
-        assert!(offer_pending(&inst, true, false));
+        let eligible = |project: &str| {
+            let mut inst = Instance::new("t", project);
+            inst.status = Status::Idle;
+            inst.command = bin.to_str().unwrap().into();
+            inst.started_at = DateTime::from_timestamp(1_000, 0);
+            inst
+        };
+        assert!(offer_pending(&eligible("/tmp/no-hook"), true, false));
 
-        inst.pending_host_env = vec![("PATH".into(), "/opt/agent-a/bin".into())];
-        assert!(!offer_pending(&inst, true, false));
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_session = vec!["export PATH=/opt/agent-a/bin:$PATH".into()];
+        })
+        .unwrap();
+        // A distinct project path avoids the cached answer from before the hook existed.
+        assert!(!offer_pending(&eligible("/tmp/with-hook"), true, false));
     }
 
     #[test]

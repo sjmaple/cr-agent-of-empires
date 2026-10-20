@@ -369,7 +369,7 @@ pub struct Instance {
     pub detection: DetectionState,
     /// Values minted by `host_hooks.before_session`; may be secrets, so never persisted.
     #[serde(skip)]
-    pub(crate) pending_host_env: Vec<(String, String)>,
+    pending_host_env: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_started_at: Option<std::time::SystemTime>,
     #[serde(skip)]
