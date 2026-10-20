@@ -640,6 +640,7 @@ pub async fn switch_acp_provider(
         .is_some_and(|model| model != PROVIDER_DEFAULT_MODEL);
     if let Err(e) = persist_provider_switch(&state, &instance.source_profile, &id, &provider).await
     {
+        state.acp_supervisor.request_respawn(&id);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to persist the provider switch: {e}"),
