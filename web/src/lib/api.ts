@@ -1928,6 +1928,13 @@ export async function startSession(id: string): Promise<StartSessionResult> {
   };
 }
 
+/** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
+export async function restartSessionForUpdate(id: string): Promise<{ ok: true } | { ok: false; message?: string }> {
+  const reply = await send(`/api/sessions/${id}/restart-for-update`, jsonInit("POST")).catch(() => null);
+  if (reply?.ok) return { ok: true };
+  return { ok: false, message: stringField(reply?.payload, "message") };
+}
+
 /** `null` unsnoozes; otherwise 1..=43200 minutes, validated server-side. */
 export function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
   return sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));

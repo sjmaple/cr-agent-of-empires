@@ -74,6 +74,7 @@ import {
   logout,
   stopSession,
   startSession,
+  restartSessionForUpdate,
   acpEnable,
   acpDisable,
   fetchAbout,
@@ -1377,6 +1378,15 @@ function AppContent({
     [setSessionStatus],
   );
 
+  const handleRestartForUpdate = useCallback(async (sessionId: string) => {
+    const result = await restartSessionForUpdate(sessionId);
+    if (!result.ok) {
+      toastBus.handler?.error(result.message ?? "Could not restart the session");
+      return;
+    }
+    toastBus.handler?.info("Restarting with the updated agent. Your conversation is kept.");
+  }, []);
+
   const handleCreateSession = useCallback(
     (repoPath: string) => {
       const projectSessions = sessions
@@ -2078,6 +2088,7 @@ function AppContent({
                 onDelete: handleDeleteSession,
                 onStop: handleStopSession,
                 onStart: handleStartSession,
+                onRestartForUpdate: handleRestartForUpdate,
                 onSwitchView: handleSwitchView,
                 onCreateSession: handleCreateSession,
               }}
@@ -2464,6 +2475,7 @@ function AppContent({
               onEmptyTrash={handleEmptyTrash}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
+              onRestartForUpdate={handleRestartForUpdate}
               onSwitchView={handleSwitchView}
               readOnly={serverAbout?.read_only}
               canManageProjects={caps.canManageProjects}
