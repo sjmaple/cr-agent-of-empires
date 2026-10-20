@@ -421,6 +421,11 @@ impl Instance {
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::Before);
 
+        self.launch_executable = prepared
+            .execution
+            .as_ref()
+            .filter(|execution| execution.inputs.container.is_none())
+            .map(|execution| execution.program.clone());
         self.finalize_launch(
             session.name(),
             profile,

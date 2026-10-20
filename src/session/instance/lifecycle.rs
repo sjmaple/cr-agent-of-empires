@@ -164,6 +164,7 @@ impl Instance {
             stored.sandbox_info = self.sandbox_info.clone();
             stored.capture_started_at = self.capture_started_at;
             stored.started_at = self.started_at;
+            stored.launch_executable = self.launch_executable.clone();
             stored.active_execution = self.active_execution.clone();
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
@@ -813,6 +814,7 @@ mod tests {
         committed.capture_started_at = Some(capture_floor);
         let launched_at = DateTime::from_timestamp(1_234_567, 0).unwrap();
         committed.started_at = Some(launched_at);
+        committed.launch_executable = Some("/opt/agent/bin/claude".into());
         committed.commit_lifecycle_launch(&storage, false).unwrap();
         let disk = storage
             .load()
@@ -825,6 +827,10 @@ mod tests {
         assert_eq!(disk.status, Status::Running);
         assert_eq!(disk.capture_started_at, Some(capture_floor));
         assert_eq!(disk.started_at, Some(launched_at));
+        assert_eq!(
+            disk.launch_executable.as_deref(),
+            Some(std::path::Path::new("/opt/agent/bin/claude"))
+        );
 
         stale
             .acquire_lifecycle_reservation(
