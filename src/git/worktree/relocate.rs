@@ -215,6 +215,16 @@ impl GitWorktree {
             "move_worktree: invoking `git worktree move`"
         );
         self.unlock_worktree(from);
+        // A relative pointer left stale by an earlier move cannot be followed.
+        if crate::git::cleanup::read_linked_worktree_gitdir(from).is_some_and(|g| !g.exists()) {
+            if let Err(e) = self.repair_worktree(from) {
+                tracing::warn!(target: "git.worktree",
+                    from = %from.display(),
+                    error = %e,
+                    "move_worktree: could not repair a stale .git pointer"
+                );
+            }
+        }
         let original_pointer = Self::convert_git_file_to_absolute(from).unwrap_or_else(|e| {
             tracing::warn!(target: "git.worktree",
                 from = %from.display(),
@@ -969,5 +979,28 @@ mod tests {
         let missing_parent = parent.path().join("missing").join("wt");
         assert!(git_wt.move_worktree(&original, &missing_parent).is_err());
         assert_eq!(std::fs::read(original.join(".git")).unwrap(), before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn move_worktree_repairs_a_relative_pointer_broken_by_an_earlier_move() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let original = parent.path().join("wt");
+        git_wt
+            .create_worktree("broken-pointer", &original, true, None)
+            .unwrap();
+
+        let trash = parent.path().join(".aoe-trash").join("id");
+        std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+        git_wt.unlock_worktree(&original);
+        std::fs::rename(&original, &trash).unwrap();
+
+        git_wt.move_worktree(&trash, &original).unwrap();
+        run_git(&original, &["status", "--porcelain"]);
     }
 }
