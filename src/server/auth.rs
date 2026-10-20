@@ -323,7 +323,7 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 pub struct AuthenticatedSession(pub String);
 
 /// Request extension marking a direct same-host connection (see
-/// [`Ingress::local_trusted`]).
+/// `Ingress::local_trusted`).
 #[derive(Clone, Copy, Debug)]
 pub struct LoopbackTrusted;
 

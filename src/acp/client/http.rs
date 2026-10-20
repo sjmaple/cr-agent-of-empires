@@ -588,7 +588,7 @@ impl HttpClient {
 
     /// The shared session list, authenticated like every other request: a cached
     /// passphrase-login session, else bearer token, else a fresh passphrase login, else
-    /// none, with the same single 401 retry as [`Self::send_authed`].
+    /// none, with the same single 401 retry as `send_authed`.
     pub async fn list_sessions(
         &self,
         state: Option<crate::session::SessionScope>,
