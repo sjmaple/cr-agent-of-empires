@@ -1036,8 +1036,11 @@ mod tests {
         expected.push(b'\n');
         assert_eq!(returned, Some(original));
         assert_eq!(std::fs::read(worktree.join(".git")).unwrap(), expected);
-        assert!(crate::git::cleanup::read_linked_worktree_gitdir(&worktree)
-            .unwrap()
-            .exists());
+        let written = std::fs::read(worktree.join(".git")).unwrap();
+        let target = written
+            .strip_prefix(b"gitdir: ")
+            .and_then(|rest| rest.strip_suffix(b"\n"))
+            .unwrap();
+        assert!(Path::new(OsStr::from_bytes(target)).exists());
     }
 }
