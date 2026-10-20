@@ -604,15 +604,29 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }
         if auth_token.is_some() && cfg!(feature = "web") {
             println!();
-            println!(
-                "Open any URL above in a browser. Share it to access from other devices on your network."
-            );
+            if allow_plaintext_remote {
+                println!(
+                    "Open any URL above in a browser. Share it to access from other devices on your network."
+                );
+            } else {
+                println!(
+                    "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
+                );
+            }
         }
 
         if open_browser && !is_daemon {
             if cfg!(feature = "web") {
-                if let Some((_, primary)) = labeled_urls.first() {
-                    maybe_open_browser(primary);
+                // The gate refuses plaintext LAN and tailnet URLs, so open the loopback one.
+                let openable = if allow_plaintext_remote {
+                    labeled_urls.first()
+                } else {
+                    labeled_urls
+                        .iter()
+                        .find(|(kind, _)| *kind == IpKind::Loopback)
+                };
+                if let Some((_, url)) = openable {
+                    maybe_open_browser(url);
                 }
             } else {
                 // Opening a browser on an API-only daemon lands on a 404.

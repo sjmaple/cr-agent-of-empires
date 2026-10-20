@@ -26,7 +26,7 @@ pub struct LogLevelArgs {
 #[tracing::instrument(target = "cli.log_level", skip_all)]
 pub async fn run(args: LogLevelArgs) -> Result<()> {
     let urls = read_serve_urls();
-    let Some(primary) = urls.first() else {
+    let Some(primary) = crate::acp::client::discovery::preferred_daemon_url(&urls) else {
         bail!("No aoe serve daemon is running, or serve.url is empty/missing.");
     };
 

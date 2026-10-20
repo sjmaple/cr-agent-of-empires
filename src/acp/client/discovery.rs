@@ -242,7 +242,9 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     })
 }
 
-fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
+/// The loopback URL when the daemon lists one, since a LAN or tailnet URL is plaintext
+/// HTTP the credential gate refuses.
+pub(crate) fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
     urls.iter()
         .find(|u| is_loopback(&u.url))
         .or_else(|| urls.first())
@@ -343,8 +345,18 @@ mod tests {
                 label: Some("localhost".into()),
                 url: "http://127.0.0.1:8080/?token=secret".into(),
             };
+            // `--host 0.0.0.0` lists the LAN and tailnet URLs before localhost.
+            let lan = ServeUrl {
+                label: None,
+                url: "http://192.168.1.5:8080/?token=secret".into(),
+            };
+            let tailnet = ServeUrl {
+                label: Some("tailscale".into()),
+                url: "http://100.64.0.7:8080/?token=secret".into(),
+            };
             for (urls, want) in [
                 (vec![public.clone(), loopback.clone()], &loopback),
+                (vec![lan, tailnet, loopback.clone()], &loopback),
                 (vec![public.clone()], &public),
             ] {
                 let selected = preferred_daemon_url(&urls).expect("a daemon URL is selected");
