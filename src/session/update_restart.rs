@@ -6,6 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 
+use crate::acp::agent_registry::AgentRegistry;
+use crate::process::worker_registry::WorkerRecord;
 use crate::session::{Instance, Status};
 
 const MTIME_TTL: Duration = Duration::from_secs(30);
@@ -14,27 +16,51 @@ const MTIME_TTL: Duration = Duration::from_secs(30);
 static MTIME_CACHE: Mutex<Option<HashMap<String, (Instant, Option<SystemTime>)>>> =
     Mutex::new(None);
 
-/// The binary whose replacement makes this session stale, or `None` when it cannot be named
-/// safely (custom agents, command overrides that carry arguments).
+/// The terminal binary whose replacement makes this session stale, or `None` when it cannot be
+/// named safely (custom agents, command overrides that carry arguments).
 fn agent_binary(inst: &Instance) -> Option<&str> {
     if inst.command.is_empty() {
         crate::agents::get_agent(&inst.tool).map(|a| a.binary)
-    } else if !inst.is_structured() && !inst.command.contains(char::is_whitespace) {
+    } else if !inst.command.contains(char::is_whitespace) {
         Some(&inst.command)
     } else {
         None
     }
 }
 
-fn binary_mtime(binary: &str) -> Option<SystemTime> {
+/// What a structured worker actually runs: the registered ACP command, which for adapter-backed
+/// agents is the adapter (it bundles its own CLI), not the CLI on `PATH`.
+fn adapter_command(inst: &Instance, record: &WorkerRecord) -> Option<String> {
+    if !inst.command.is_empty() {
+        return None;
+    }
+    AgentRegistry::with_defaults()
+        .get(&record.agent_key)
+        .map(|spec| spec.command.clone())
+}
+
+/// `acp` resolves the command as the daemon does when it spawns the adapter, so a pinned bundled
+/// copy is watched when it is the one in use.
+fn binary_mtime(binary: &str, acp: bool) -> Option<SystemTime> {
+    let key = if acp {
+        format!("acp:{binary}")
+    } else {
+        binary.to_string()
+    };
     let mut guard = MTIME_CACHE.lock().ok()?;
     let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some((at, mtime)) = cache.get(binary) {
+    if let Some((at, mtime)) = cache.get(&key) {
         if at.elapsed() < MTIME_TTL {
             return *mtime;
         }
     }
-    let mtime = which::which(binary).ok().and_then(|path| {
+    let path = if acp {
+        let app_dir = crate::session::get_app_dir().ok();
+        crate::acp::acp_client::resolve_agent_command(binary, app_dir.as_deref()).map(|r| r.path)
+    } else {
+        which::which(binary).ok()
+    };
+    let mtime = path.and_then(|path| {
         // A package manager may keep a fixed mtime on the target but recreate the bin symlink.
         let target = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let link = std::fs::symlink_metadata(&path)
@@ -42,7 +68,7 @@ fn binary_mtime(binary: &str) -> Option<SystemTime> {
             .ok();
         target.max(link)
     });
-    cache.insert(binary.to_string(), (Instant::now(), mtime));
+    cache.insert(key, (Instant::now(), mtime));
     mtime
 }
 
@@ -52,31 +78,30 @@ fn modified_after(mtime: SystemTime, started_at: DateTime<Utc>) -> bool {
     modified as i64 > started_at.timestamp()
 }
 
-/// When the process this row is running was launched.
-fn process_started_at(inst: &Instance) -> Option<DateTime<Utc>> {
-    if inst.is_structured() {
-        let record = crate::process::worker_registry::load(&inst.id)
-            .ok()
-            .flatten()?;
-        DateTime::from_timestamp(i64::try_from(record.started_at).ok()?, 0)
-    } else {
-        inst.started_at
-    }
-}
-
 /// An idle row whose agent binary was replaced after launch. Reads only the row and the
 /// filesystem, so it is safe to call while painting.
 pub fn binary_updated(inst: &Instance) -> bool {
     if inst.status != Status::Idle || inst.is_archived() || inst.is_trashed() {
         return false;
     }
-    let Some(binary) = agent_binary(inst) else {
-        return false;
+    let stale = if inst.is_structured() {
+        crate::process::worker_registry::load(&inst.id)
+            .ok()
+            .flatten()
+            .and_then(|record| {
+                let started_at =
+                    DateTime::from_timestamp(i64::try_from(record.started_at).ok()?, 0)?;
+                let command = adapter_command(inst, &record)?;
+                Some(modified_after(binary_mtime(&command, true)?, started_at))
+            })
+    } else {
+        agent_binary(inst)
+            .zip(inst.started_at)
+            .and_then(|(binary, started_at)| {
+                Some(modified_after(binary_mtime(binary, false)?, started_at))
+            })
     };
-    match (process_started_at(inst), binary_mtime(binary)) {
-        (Some(started_at), Some(mtime)) => modified_after(mtime, started_at),
-        _ => false,
-    }
+    stale.unwrap_or(false)
 }
 
 /// Whether to offer "restart to apply update". `resume_available` is the row's
@@ -114,6 +139,33 @@ mod tests {
         inst.command.clear();
         inst.tool = "not-an-agent".into();
         assert_eq!(agent_binary(&inst), None);
+    }
+
+    #[test]
+    fn a_structured_worker_watches_its_adapter_not_the_cli() {
+        let record = |agent_key: &str| {
+            WorkerRecord::new(
+                "t".into(),
+                1,
+                "/tmp/s".into(),
+                agent_key.into(),
+                agent_key.into(),
+                "/tmp".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+        };
+        let mut inst = Instance::new("t", "/tmp");
+        assert_eq!(
+            adapter_command(&inst, &record("claude")).as_deref(),
+            Some("claude-agent-acp")
+        );
+        assert_eq!(adapter_command(&inst, &record("my-custom")), None);
+        inst.command = "wrapper".into();
+        assert_eq!(adapter_command(&inst, &record("claude")), None);
     }
 
     #[test]
