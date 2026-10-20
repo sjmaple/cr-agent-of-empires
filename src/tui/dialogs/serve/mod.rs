@@ -1065,19 +1065,22 @@ mod tests {
         };
         view.tick();
         gate.wait_entered();
-        for _ in 0..5 {
-            view.tick();
-        }
-        assert!(
-            gate.entered.try_recv().is_err(),
-            "a second probe was queued"
-        );
-
-        // A result for an attempt the state no longer awaits must not change it.
         let ServeViewState::Starting { probe, .. } = &view.state else {
             panic!("not starting");
         };
         let current = probe.expect("a probe is in flight");
+        // The blocked FIFO worker hides queued requests, so count enqueues instead.
+        let enqueued = view.last_attempt;
+        for _ in 0..5 {
+            view.tick();
+        }
+        assert_eq!(view.last_attempt, enqueued, "a second probe was queued");
+        assert!(matches!(
+            view.state,
+            ServeViewState::Starting { probe: Some(p), .. } if p == current
+        ));
+
+        // A result for an attempt the state no longer awaits must not change it.
         assert!(!view.apply_job(current - 1, JobDone::Probe(false)));
         assert!(matches!(
             view.state,
