@@ -74,7 +74,6 @@ import {
   logout,
   stopSession,
   startSession,
-  restartSessionForUpdate,
   acpEnable,
   acpDisable,
   fetchAbout,
@@ -107,6 +106,7 @@ import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionCo
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
+import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -1378,15 +1378,6 @@ function AppContent({
     [setSessionStatus],
   );
 
-  const handleRestartForUpdate = useCallback(async (sessionId: string) => {
-    const result = await restartSessionForUpdate(sessionId);
-    if (!result.ok) {
-      toastBus.handler?.error(result.message ?? "Could not restart the session");
-      return;
-    }
-    toastBus.handler?.info("Restarting with the updated agent. Your conversation is kept.");
-  }, []);
-
   const handleCreateSession = useCallback(
     (repoPath: string) => {
       const projectSessions = sessions
@@ -2088,7 +2079,7 @@ function AppContent({
                 onDelete: handleDeleteSession,
                 onStop: handleStopSession,
                 onStart: handleStartSession,
-                onRestartForUpdate: handleRestartForUpdate,
+                onRestartForUpdate: restartForUpdate,
                 onSwitchView: handleSwitchView,
                 onCreateSession: handleCreateSession,
               }}
@@ -2475,7 +2466,7 @@ function AppContent({
               onEmptyTrash={handleEmptyTrash}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
-              onRestartForUpdate={handleRestartForUpdate}
+              onRestartForUpdate={restartForUpdate}
               onSwitchView={handleSwitchView}
               readOnly={serverAbout?.read_only}
               canManageProjects={caps.canManageProjects}
