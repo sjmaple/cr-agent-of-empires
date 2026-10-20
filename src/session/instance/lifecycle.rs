@@ -163,6 +163,7 @@ impl Instance {
             stored.last_accessed_at = self.last_accessed_at;
             stored.sandbox_info = self.sandbox_info.clone();
             stored.capture_started_at = self.capture_started_at;
+            stored.started_at = self.started_at;
             stored.active_execution = self.active_execution.clone();
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
@@ -810,6 +811,8 @@ mod tests {
         let capture_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
         committed.status = Status::Running;
         committed.capture_started_at = Some(capture_floor);
+        let launched_at = DateTime::from_timestamp(1_234_567, 0).unwrap();
+        committed.started_at = Some(launched_at);
         committed.commit_lifecycle_launch(&storage, false).unwrap();
         let disk = storage
             .load()
@@ -821,6 +824,7 @@ mod tests {
         assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
         assert_eq!(disk.status, Status::Running);
         assert_eq!(disk.capture_started_at, Some(capture_floor));
+        assert_eq!(disk.started_at, Some(launched_at));
 
         stale
             .acquire_lifecycle_reservation(
