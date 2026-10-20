@@ -1221,9 +1221,94 @@ pub async fn start_session(
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
     }
 
-    // Plain session: restart the tmux pane, mirroring ensure_session. Show
-    // Starting immediately so the status poller does not flip it back while the
-    // restart is in flight.
+    // Explicit restart endpoint: honor auto_resume_on_restart, same as TUI `e`/`Enter`.
+    restart_plain_session(
+        &state,
+        id,
+        instance,
+        crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+    )
+    .await
+}
+
+/// Restart a session whose agent binary was replaced after launch (#4214). Eligibility is
+/// re-checked here because the list that offered it may be several seconds old.
+pub async fn restart_for_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return session_not_found();
+        };
+        inst.clone()
+    };
+    let structured_ready = state
+        .acp_supervisor
+        .worker_states_snapshot()
+        .await
+        .get(&id)
+        .is_some_and(|(worker, _)| *worker == crate::daemon::AcpWorkerState::Running)
+        && state
+            .acp_event_store
+            .pending_approval_requests(&id)
+            .is_empty();
+    let resume_available = matches!(
+        context_resume_for(&instance),
+        ContextResumeAvailability::Available
+    );
+    if !crate::session::update_restart::offer_pending(&instance, resume_available, structured_ready)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_eligible",
+            "Session is busy or its agent is not out of date".to_string(),
+        );
+    }
+
+    if instance.is_structured() {
+        // The reconciler terminates the worker once its turn drains and respawns it against the
+        // stored conversation.
+        state.acp_supervisor.mark_build_respawn_pending(&id);
+        let response = SessionResponse::from_instance(
+            &instance,
+            crate::claude_settings::read_tui_fullscreen(),
+        );
+        return (StatusCode::ACCEPTED, Json(response)).into_response();
+    }
+
+    // The button promises the conversation survives, so resume even if the user turned off
+    // auto-resume for ordinary restarts.
+    restart_plain_session(
+        &state,
+        id,
+        instance,
+        crate::session::ResumeAttemptPolicy::Allow,
+    )
+    .await
+}
+
+/// Restart a plain session's tmux pane, mirroring `ensure_session`. The caller holds the
+/// instance lock.
+async fn restart_plain_session(
+    state: &Arc<AppState>,
+    id: String,
+    instance: Instance,
+    resume_policy: crate::session::ResumeAttemptPolicy,
+) -> axum::response::Response {
+    // Show Starting immediately so the status poller does not flip it back while the restart is
+    // in flight.
     {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
@@ -1238,15 +1323,9 @@ pub async fn start_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            // Explicit restart endpoint: honor auto_resume_on_restart, same as
-            // TUI `e`/`Enter`. The instance-level cascade holds the lifecycle
-            // lock across final poller drain, exact-pane OMP capture, kill and
-            // relaunch.
-            match inst.restart_with_resume_policy(
-                None,
-                false,
-                crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
-            ) {
+            // The instance-level cascade holds the lifecycle lock across final poller drain,
+            // exact-pane OMP capture, kill and relaunch.
+            match inst.restart_with_resume_policy(None, false, resume_policy) {
                 Ok(outcome) => Ok((inst, outcome)),
                 Err(e) => Err(Box::new((inst, e))),
             }

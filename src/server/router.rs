@@ -134,6 +134,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
+            "/api/sessions/{id}/restart-for-update",
+            post(api::restart_for_update),
+        )
+        .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
         )

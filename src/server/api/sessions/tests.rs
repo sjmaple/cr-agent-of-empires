@@ -4399,6 +4399,26 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
     );
 }
 #[tokio::test]
+async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
+    let mut inst = Instance::new("fresh-agent", "/tmp/fresh-agent");
+    inst.id = "fresh-agent".to_string();
+    inst.status = Status::Idle;
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    for (id, expected) in [
+        ("fresh-agent", StatusCode::CONFLICT),
+        ("missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = restart_for_update(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), expected, "{id}");
+    }
+}
+
+#[tokio::test]
 async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     use crate::acp::permissions::build_approval;
     use crate::acp::state::ToolCall;

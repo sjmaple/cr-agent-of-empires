@@ -260,6 +260,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/sessions/{id}/snooze"),
     ("PATCH", "/api/sessions/{id}/unread"),
     ("PATCH", "/api/sessions/{id}/worktree-name"),
+    ("POST", "/api/sessions/{id}/restart-for-update"),
     ("POST", "/api/sessions/{id}/restore"),
     ("POST", "/api/sessions/{id}/start"),
     ("POST", "/api/sessions/{id}/stop"),
