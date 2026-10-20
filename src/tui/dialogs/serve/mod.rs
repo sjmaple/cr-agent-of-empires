@@ -992,6 +992,14 @@ mod tests {
         release: std::sync::mpsc::Sender<JobDone>,
     }
 
+    impl Gate {
+        fn wait_entered(&self) {
+            self.entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("job never reached the worker");
+        }
+    }
+
     fn gated_view() -> (ServeView, Gate) {
         let (entered_tx, entered) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
@@ -1022,7 +1030,7 @@ mod tests {
     fn a_held_probe_at_construction_leaves_the_dialog_responsive() {
         let (_temp, _guard) = isolated();
         let (mut view, gate) = gated_view();
-        gate.entered.recv().unwrap();
+        gate.wait_entered();
 
         assert!(!view.tick());
         assert!(matches!(
@@ -1044,7 +1052,7 @@ mod tests {
     fn a_starting_dialog_keeps_one_probe_in_flight_and_ignores_a_stale_result() {
         let (_temp, _guard) = isolated();
         let (mut view, gate) = gated_view();
-        gate.entered.recv().unwrap();
+        gate.wait_entered();
         gate.release.send(JobDone::Probe(true)).unwrap();
         // The construction probe is stale once the state is replaced.
         view.state = ServeViewState::Starting {
@@ -1056,7 +1064,7 @@ mod tests {
             probe: None,
         };
         view.tick();
-        gate.entered.recv().unwrap();
+        gate.wait_entered();
         for _ in 0..5 {
             view.tick();
         }
@@ -1065,20 +1073,17 @@ mod tests {
             "a second probe was queued"
         );
 
-        // The result of the first probe arrives for an attempt the state no longer awaits.
-        let ServeViewState::Starting { probe, .. } = &mut view.state else {
+        // A result for an attempt the state no longer awaits must not change it.
+        let ServeViewState::Starting { probe, .. } = &view.state else {
             panic!("not starting");
         };
-        *probe = Some(u64::MAX);
-        gate.release.send(JobDone::Probe(false)).unwrap();
-        view.tick();
+        let current = probe.expect("a probe is in flight");
+        assert!(!view.apply_job(current - 1, JobDone::Probe(false)));
         assert!(matches!(
             view.state,
-            ServeViewState::Starting {
-                probe: Some(u64::MAX),
-                ..
-            }
+            ServeViewState::Starting { probe: Some(p), .. } if p == current
         ));
+        gate.release.send(JobDone::Probe(true)).unwrap();
     }
 
     #[test]
@@ -1086,10 +1091,10 @@ mod tests {
     fn a_held_launch_leaves_the_dialog_responsive_and_only_the_current_attempt_applies() {
         let (_temp, _guard) = isolated();
         let (mut view, gate) = gated_view();
-        gate.entered.recv().unwrap();
+        gate.wait_entered();
         gate.release.send(JobDone::Probe(true)).unwrap();
         view.spawn(ServeMode::Local, None);
-        gate.entered.recv().unwrap();
+        gate.wait_entered();
 
         assert!(!view.tick());
         assert!(matches!(
