@@ -556,6 +556,7 @@ impl Instance {
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
+        self.started_at = Some(Utc::now());
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.

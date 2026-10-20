@@ -200,6 +200,9 @@ pub struct Instance {
     pub last_accessed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_entered_at: Option<DateTime<Utc>>,
+    /// Wall-clock launch of the current agent process; `None` until the first launch after upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
