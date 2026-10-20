@@ -72,6 +72,40 @@ fn binary_mtime(binary: &str, acp: bool) -> Option<SystemTime> {
     mtime
 }
 
+type LaunchPathKey = (String, String);
+
+/// Bounded by the number of distinct profile and project pairs.
+static LAUNCH_PATH_CACHE: Mutex<Option<HashMap<LaunchPathKey, (Instant, bool)>>> = Mutex::new(None);
+
+fn environment_sets_path(entries: &[String]) -> bool {
+    entries.iter().any(|entry| entry.starts_with("PATH="))
+}
+
+/// Whether the session's launch environment may resolve the agent through a PATH other than
+/// AoE's. Fails closed when the config cannot be read.
+fn launch_path_overridden(inst: &Instance) -> bool {
+    if inst.pending_host_env.iter().any(|(key, _)| key == "PATH") {
+        return true;
+    }
+    let key = (inst.effective_profile(), inst.project_path.clone());
+    let Ok(mut guard) = LAUNCH_PATH_CACHE.lock() else {
+        return true;
+    };
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some((at, overridden)) = cache.get(&key) {
+        if at.elapsed() < MTIME_TTL {
+            return *overridden;
+        }
+    }
+    let overridden = crate::session::config::repo_config::resolve_config_with_repo(
+        &key.0,
+        std::path::Path::new(&key.1),
+    )
+    .map_or(true, |config| environment_sets_path(&config.environment));
+    cache.insert(key, (Instant::now(), overridden));
+    overridden
+}
+
 /// Whole seconds, so a binary written in the launch second is not flagged.
 fn modified_after(mtime: SystemTime, started_at: DateTime<Utc>) -> bool {
     let modified = mtime.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -114,6 +148,9 @@ pub fn offer_pending(inst: &Instance, resume_available: bool, structured_ready: 
         && resume_available
         && (!inst.is_structured() || structured_ready)
         && binary_updated(inst)
+        // Terminal launches resolve the agent through the session's own environment, which the
+        // host lookup in `binary_updated` cannot see. Reads config, so never call it from paint.
+        && (inst.is_structured() || !launch_path_overridden(inst))
 }
 
 #[cfg(test)]
@@ -197,6 +234,39 @@ mod tests {
             container_workdir: None,
         });
         assert!(!binary_updated(&inst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_launch_environment_that_sets_path_is_never_offered() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let bin = temp.path().join("agent");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut inst = Instance::new("t", temp.path().to_str().unwrap());
+        inst.status = Status::Idle;
+        inst.command = bin.to_str().unwrap().into();
+        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        assert!(offer_pending(&inst, true, false));
+
+        inst.pending_host_env = vec![("PATH".into(), "/opt/agent-a/bin".into())];
+        assert!(!offer_pending(&inst, true, false));
+    }
+
+    #[test]
+    fn only_a_path_assignment_overrides_the_host_path() {
+        let entries = |list: &[&str]| list.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        assert!(environment_sets_path(&entries(&[
+            "FOO=1",
+            "PATH=/opt/a:$PATH"
+        ])));
+        assert!(!environment_sets_path(&entries(&[
+            "FOO=1", "PATHS=x", "PATH"
+        ])));
     }
 
     #[test]
