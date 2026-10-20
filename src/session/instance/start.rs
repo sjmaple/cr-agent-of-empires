@@ -342,6 +342,12 @@ impl Instance {
         if let Some(canonical) = prepared.canonical_conversation.take() {
             self.adopt_conversation_state(canonical);
         }
+        // Before the `take` below consumes the execution.
+        self.launch_executable = prepared
+            .execution
+            .as_ref()
+            .filter(|execution| execution.inputs.container.is_none())
+            .map(|execution| execution.program.clone());
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
@@ -421,11 +427,6 @@ impl Instance {
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::Before);
 
-        self.launch_executable = prepared
-            .execution
-            .as_ref()
-            .filter(|execution| execution.inputs.container.is_none())
-            .map(|execution| execution.program.clone());
         self.finalize_launch(
             session.name(),
             profile,
