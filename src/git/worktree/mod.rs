@@ -226,6 +226,23 @@ impl GitWorktree {
         Ok(())
     }
 
+    /// Rewrite a relative `gitdir:` pointer as an absolute one, for git versions
+    /// whose `worktree move` validation cannot follow a relative pointer.
+    /// A pointer that does not resolve is left for git to report.
+    fn convert_git_file_to_absolute(worktree_path: &Path) -> Result<()> {
+        let git_file = worktree_path.join(".git");
+        if !git_file.is_file() {
+            return Ok(());
+        }
+        let Some(gitdir) = crate::git::cleanup::read_linked_worktree_gitdir(worktree_path) else {
+            return Ok(());
+        };
+        if let Ok(absolute) = gitdir.canonicalize() {
+            std::fs::write(&git_file, format!("gitdir: {}\n", absolute.display()))?;
+        }
+        Ok(())
+    }
+
     /// Relative path from `base` to `target`.
     pub(crate) fn diff_paths(target: &Path, base: &Path) -> Option<PathBuf> {
         let mut target_components = target.components().peekable();

@@ -215,6 +215,13 @@ impl GitWorktree {
             "move_worktree: invoking `git worktree move`"
         );
         self.unlock_worktree(from);
+        if let Err(e) = Self::convert_git_file_to_absolute(from) {
+            tracing::warn!(target: "git.worktree",
+                from = %from.display(),
+                error = %e,
+                "move_worktree: could not make the .git pointer absolute"
+            );
+        }
         let Some(output) = run_git_with_timeout(
             &self.repo_path,
             ["worktree", "move", from_str, to_str],
@@ -906,5 +913,32 @@ mod tests {
             record.lines().any(|line| line.starts_with("locked")),
             "{listing}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn move_worktree_round_trips_a_relative_gitdir_pointer_through_a_deeper_path() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let original = parent.path().join("wt");
+        git_wt
+            .create_worktree("relative-pointer", &original, true, None)
+            .unwrap();
+        let pointer = |path: &Path| std::fs::read_to_string(path.join(".git")).unwrap();
+        assert!(pointer(&original).starts_with("gitdir: ../"));
+
+        GitWorktree::convert_git_file_to_absolute(&original).unwrap();
+        assert!(Path::new(pointer(&original)["gitdir: ".len()..].trim()).is_absolute());
+        GitWorktree::convert_git_file_to_relative(&original).unwrap();
+
+        let trash = parent.path().join(".aoe-trash").join("id");
+        std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+        git_wt.move_worktree(&original, &trash).unwrap();
+        git_wt.move_worktree(&trash, &original).unwrap();
+        run_git(&original, &["status", "--porcelain"]);
     }
 }
