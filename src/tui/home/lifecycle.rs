@@ -435,6 +435,10 @@ impl HomeView {
                 crate::cli::serve::daemon_pid().is_some()
             }),
             serve_probe_in_flight: false,
+            recovery_probe: crate::tui::worker::Worker::spawn("aoe-recovery-probe", |()| {
+                crate::cli::serve::daemon_pid().is_some()
+            }),
+            recovery_probe_in_flight: false,
             idle_decay_window,
             settings_view: None,
             settings_close_confirm: false,

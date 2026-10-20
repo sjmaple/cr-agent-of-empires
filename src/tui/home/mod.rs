@@ -382,6 +382,9 @@ pub struct HomeView {
     pub(super) serve_running: bool,
     pub(super) serve_probe: crate::tui::worker::Worker<(), bool>,
     pub(super) serve_probe_in_flight: bool,
+    /// A fresh check before startup recovery; the badge result may be stale.
+    pub(super) recovery_probe: crate::tui::worker::Worker<(), bool>,
+    pub(super) recovery_probe_in_flight: bool,
 
     pub(super) settings_view: Option<SettingsView>,
     pub(super) settings_close_confirm: bool,

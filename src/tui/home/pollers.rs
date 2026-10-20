@@ -527,6 +527,7 @@ impl HomeView {
     /// Applies before requesting so a queued result frees the in-flight slot
     /// for a due probe. True when the running state changed.
     pub fn tick_serve_probe(&mut self, due: bool) -> bool {
+        self.apply_recovery_probe();
         let changed = self.apply_serve_probe();
         if due {
             self.request_serve_probe();
@@ -553,13 +554,31 @@ impl HomeView {
         std::mem::take(&mut self.restarted_attaches)
     }
 
+    /// Recovery waits for a fresh probe: a daemon owns recovery when one is running.
     pub(super) fn maybe_start_startup_recovery(&mut self) {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if tokio::runtime::Handle::try_current().is_err() || self.recovery_probe_in_flight {
             return;
         }
-        if crate::cli::serve::daemon_pid().is_some() {
-            return;
+        self.recovery_probe_in_flight = true;
+        self.recovery_probe.request(());
+    }
+
+    fn apply_recovery_probe(&mut self) {
+        match self.recovery_probe.try_recv() {
+            Ok(daemon_running) => {
+                self.recovery_probe_in_flight = false;
+                if !daemon_running {
+                    self.start_startup_recovery();
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.recovery_probe_in_flight = false;
+            }
         }
+    }
+
+    fn start_startup_recovery(&mut self) {
         let lock = match crate::session::recovery::try_acquire_recovery_lock() {
             Ok(Some(l)) => l,
             Ok(None) => {

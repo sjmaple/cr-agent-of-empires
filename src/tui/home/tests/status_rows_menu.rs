@@ -2109,3 +2109,38 @@ fn due_serve_probe_is_requested_after_a_queued_result_is_applied() {
         "the due probe must be requested in the same tick"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn startup_recovery_probe_does_not_block_and_a_running_daemon_skips_recovery() {
+    let mut env = create_test_env_with_sessions(1);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<bool>();
+    env.view.recovery_probe = crate::tui::worker::Worker::spawn("recovery-probe-test", move |()| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap()
+    });
+
+    env.view.maybe_start_startup_recovery();
+    env.view.maybe_start_startup_recovery();
+    entered_rx.recv().unwrap();
+    assert!(env.view.recovery_probe_in_flight);
+
+    // The held probe leaves the event loop's tick runnable and recovery unstarted.
+    env.view.tick_serve_probe(false);
+    assert!(env.view.recovery_probe_in_flight);
+    assert!(env.view.recovery_lock.is_none());
+    assert!(
+        entered_rx.try_recv().is_err(),
+        "a second request must not queue while one is in flight"
+    );
+
+    release_tx.send(true).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while env.view.recovery_probe_in_flight {
+        env.view.tick_serve_probe(false);
+        assert!(std::time::Instant::now() < deadline, "probe never applied");
+        std::thread::yield_now();
+    }
+    assert!(env.view.recovery_lock.is_none(), "a daemon owns recovery");
+}
