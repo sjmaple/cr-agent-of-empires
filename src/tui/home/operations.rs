@@ -336,6 +336,61 @@ impl HomeView {
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.restart_selected_session_with_wake(
+            new_profile,
+            new_tool,
+            new_extra_args,
+            new_command_override,
+            None,
+        )
+    }
+
+    /// Whether the session runs an agent binary replaced since launch and may be restarted for
+    /// it now. Structured rows are left to the web dashboard: this restart path cannot respawn a
+    /// structured worker.
+    pub(super) fn update_restart_offered(&self, id: &str) -> bool {
+        self.get_instance(id).is_some_and(|inst| {
+            crate::session::update_restart::offer_pending(
+                inst,
+                inst.terminal_context_resume_cached()
+                    == crate::session::TerminalContextResume::Available,
+                false,
+            )
+        })
+    }
+
+    /// Restart the selected session onto the updated agent, with no wake-up message. The restart
+    /// resumes through `auto_resume_on_restart`, so the offer's "conversation kept" promise only
+    /// holds while that is on.
+    pub(super) fn restart_selected_for_update(&mut self) -> anyhow::Result<()> {
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        let Some(profile) = self
+            .get_instance(&id)
+            .filter(|_| self.update_restart_offered(&id))
+            .map(|inst| inst.effective_profile())
+        else {
+            return Ok(());
+        };
+        let auto_resume = crate::session::resolve_config(&profile)
+            .map(|c| c.session.auto_resume_on_restart)
+            .unwrap_or(true);
+        if !auto_resume {
+            anyhow::bail!("auto_resume_on_restart is off, so a restart would start a new conversation. Restart with 'e' if that is intended");
+        }
+        self.restart_selected_session_with_wake(None, None, None, None, Some(String::new()))
+    }
+
+    /// `wake_message` replaces `session.restart_wake_message` when set.
+    fn restart_selected_session_with_wake(
+        &mut self,
+        new_profile: Option<&str>,
+        new_tool: Option<&str>,
+        new_extra_args: Option<&str>,
+        new_command_override: Option<&str>,
+        wake_message: Option<String>,
+    ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
             None => return Ok(()),
@@ -548,9 +603,11 @@ impl HomeView {
 
         // Resolve the wake message on the main thread (config access). Empty is
         // the documented opt-out; the worker skips the wake-up then.
-        let wake_message = crate::session::resolve_config(&instance.source_profile)
-            .map(|c| c.session.restart_wake_message.clone())
-            .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
+        let wake_message = wake_message.unwrap_or_else(|| {
+            crate::session::resolve_config(&instance.source_profile)
+                .map(|c| c.session.restart_wake_message.clone())
+                .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string())
+        });
 
         self.restart_in_flight.insert(id.clone());
         self.restart_poller.request_restart(RestartRequest {

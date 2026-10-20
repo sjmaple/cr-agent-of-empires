@@ -60,17 +60,10 @@ fn process_started_at(inst: &Instance) -> Option<DateTime<Utc>> {
     }
 }
 
-/// Whether to offer "restart to apply update". `resume_available` is the row's
-/// `ContextResumeAvailability::Available`; `structured_ready` is a running worker with no pending
-/// approvals. The restart must keep the conversation, so every gate fails closed.
-pub fn offer_pending(inst: &Instance, resume_available: bool, structured_ready: bool) -> bool {
-    if inst.status != Status::Idle
-        || !inst.queued_prompts.is_empty()
-        || !resume_available
-        || (inst.is_structured() && !structured_ready)
-        || inst.is_archived()
-        || inst.is_trashed()
-    {
+/// An idle row whose agent binary was replaced after launch. Reads only the row and the
+/// filesystem, so it is safe to call while painting.
+pub fn binary_updated(inst: &Instance) -> bool {
+    if inst.status != Status::Idle || inst.is_archived() || inst.is_trashed() {
         return false;
     }
     let Some(binary) = agent_binary(inst) else {
@@ -80,6 +73,16 @@ pub fn offer_pending(inst: &Instance, resume_available: bool, structured_ready: 
         (Some(started_at), Some(mtime)) => modified_after(mtime, started_at),
         _ => false,
     }
+}
+
+/// Whether to offer "restart to apply update". `resume_available` is the row's
+/// `ContextResumeAvailability::Available`; `structured_ready` is a running worker with no pending
+/// approvals. The restart must keep the conversation, so every gate fails closed.
+pub fn offer_pending(inst: &Instance, resume_available: bool, structured_ready: bool) -> bool {
+    inst.queued_prompts.is_empty()
+        && resume_available
+        && (!inst.is_structured() || structured_ready)
+        && binary_updated(inst)
 }
 
 #[cfg(test)]
