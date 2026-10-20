@@ -215,19 +215,25 @@ impl GitWorktree {
             "move_worktree: invoking `git worktree move`"
         );
         self.unlock_worktree(from);
-        if let Err(e) = Self::convert_git_file_to_absolute(from) {
+        let original_pointer = Self::convert_git_file_to_absolute(from).unwrap_or_else(|e| {
             tracing::warn!(target: "git.worktree",
                 from = %from.display(),
                 error = %e,
                 "move_worktree: could not make the .git pointer absolute"
             );
-        }
-        let Some(output) = run_git_with_timeout(
+            None
+        });
+        let restore_pointer = || {
+            if let Some(original) = &original_pointer {
+                let _ = std::fs::write(from.join(".git"), original);
+            }
+        };
+        let moved = run_git_with_timeout(
             &self.repo_path,
             ["worktree", "move", from_str, to_str],
             WORKTREE_MUTATION_TIMEOUT,
-        )?
-        else {
+        );
+        let Some(output) = moved.inspect_err(|_| restore_pointer())? else {
             let secs = WORKTREE_MUTATION_TIMEOUT.as_secs();
             match observe_worktree_move(&self.repo_path, &observation_from, &observation_to) {
                 TimedMutationOutcome::Applied => {
@@ -239,6 +245,7 @@ impl GitWorktree {
                     if matches!(from.try_exists(), Ok(true))
                         && matches!(to.try_exists(), Ok(false)) =>
                 {
+                    restore_pointer();
                     let _ = self.lock_worktree(from);
                     return Err(GitError::WorktreeCommandFailed(format!(
                         "`git worktree move` timed out after {secs}s without moving"
@@ -261,6 +268,7 @@ impl GitWorktree {
                     return self.relocate_worktree_with_submodules(from, to);
                 }
             }
+            restore_pointer();
             let _ = self.lock_worktree(from);
             return Err(error);
         }
@@ -931,14 +939,35 @@ mod tests {
         let pointer = |path: &Path| std::fs::read_to_string(path.join(".git")).unwrap();
         assert!(pointer(&original).starts_with("gitdir: ../"));
 
+        let relative = pointer(&original);
         GitWorktree::convert_git_file_to_absolute(&original).unwrap();
         assert!(Path::new(pointer(&original)["gitdir: ".len()..].trim()).is_absolute());
-        GitWorktree::convert_git_file_to_relative(&original).unwrap();
+        std::fs::write(original.join(".git"), relative).unwrap();
 
         let trash = parent.path().join(".aoe-trash").join("id");
         std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
         git_wt.move_worktree(&original, &trash).unwrap();
         git_wt.move_worktree(&trash, &original).unwrap();
         run_git(&original, &["status", "--porcelain"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_move_restores_the_relative_gitdir_pointer() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let original = parent.path().join("wt");
+        git_wt
+            .create_worktree("failed-move", &original, true, None)
+            .unwrap();
+        let before = std::fs::read(original.join(".git")).unwrap();
+
+        let missing_parent = parent.path().join("missing").join("wt");
+        assert!(git_wt.move_worktree(&original, &missing_parent).is_err());
+        assert_eq!(std::fs::read(original.join(".git")).unwrap(), before);
     }
 }

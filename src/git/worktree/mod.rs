@@ -228,19 +228,28 @@ impl GitWorktree {
 
     /// Rewrite a relative `gitdir:` pointer as an absolute one, for git versions
     /// whose `worktree move` validation cannot follow a relative pointer.
-    /// A pointer that does not resolve is left for git to report.
-    fn convert_git_file_to_absolute(worktree_path: &Path) -> Result<()> {
+    /// Returns the original file bytes when it rewrote, so a failed move can
+    /// restore them. A pointer that does not resolve is left for git to report.
+    fn convert_git_file_to_absolute(worktree_path: &Path) -> Result<Option<Vec<u8>>> {
         let git_file = worktree_path.join(".git");
         if !git_file.is_file() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(gitdir) = crate::git::cleanup::read_linked_worktree_gitdir(worktree_path) else {
-            return Ok(());
+            return Ok(None);
         };
-        if let Ok(absolute) = gitdir.canonicalize() {
-            std::fs::write(&git_file, format!("gitdir: {}\n", absolute.display()))?;
+        let Ok(absolute) = gitdir.canonicalize() else {
+            return Ok(None);
+        };
+        let original = std::fs::read(&git_file)?;
+        let mut pointer = b"gitdir: ".to_vec();
+        pointer.extend_from_slice(absolute.as_os_str().as_encoded_bytes());
+        pointer.push(b'\n');
+        if pointer == original {
+            return Ok(None);
         }
-        Ok(())
+        std::fs::write(&git_file, pointer)?;
+        Ok(Some(original))
     }
 
     /// Relative path from `base` to `target`.
