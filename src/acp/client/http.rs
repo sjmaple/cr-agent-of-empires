@@ -200,10 +200,16 @@ impl HttpClient {
         // safe code and a passphrase to confirm gets one step-up attempt.
         let unnamed_forbidden = status == StatusCode::FORBIDDEN
             && AoeErrorCode::from_response(status, res.headers()).is_none();
+        let original = classify_error(status, res.headers(), scope);
         if !unnamed_forbidden || self.endpoint.resolved_passphrase().is_none() {
-            return Err(classify_error(status, res.headers(), scope));
+            return Err(original);
         }
-        passphrase_session::elevate(&self.endpoint, &self.passphrase_session).await?;
+        if let Err(error) =
+            passphrase_session::elevate(&self.endpoint, &self.passphrase_session).await
+        {
+            tracing::debug!(target: "acp.client.http", "step-up failed: {error}");
+            return Err(original);
+        }
         let res = self.send_authed(&build).await?;
         finish(res, scope).await
     }
@@ -1231,6 +1237,30 @@ mod tests {
         client.list_sessions(None).await.unwrap();
         assert_eq!(daemon.logins(), 1);
         assert_eq!(daemon.list_requests().len(), 3);
+    }
+
+    /// A failed step-up must not replace the daemon's own 403 with a misleading 401.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_step_up_keeps_the_original_forbidden() {
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "hunter2")]);
+        let (base, server) =
+            stalled_body_server("HTTP/1.1 403 Forbidden\r\nContent-Length: 1000000\r\n\r\n").await;
+        let client =
+            HttpClient::new(DaemonEndpoint::new(base, Some("tok".into()), Source::Env)).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.set_plugin_enabled("p", true),
+        )
+        .await
+        .expect("step-up waited on the error body")
+        .unwrap_err();
+        assert!(
+            matches!(error, HttpError::Server { status } if status == StatusCode::FORBIDDEN),
+            "{error}"
+        );
+        server.abort();
     }
 
     /// Serves every connection the status line and headers, then never the promised body.
