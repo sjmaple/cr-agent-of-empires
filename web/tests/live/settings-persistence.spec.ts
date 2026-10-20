@@ -10,19 +10,14 @@ import { appDirFor, loginWithPassphrase, resolveAoeBinary, spawnAoeServe } from 
 test.describe("theme API", () => {
   let handle: ServeHandle;
   test.beforeAll(async ({}, workerInfo) => {
-    handle = await spawnAoeServe({
-      workerIndex: workerInfo.workerIndex,
-      parallelIndex: workerInfo.parallelIndex,
-    });
+    handle = await spawnAoeServe({ workerIndex: workerInfo.workerIndex, parallelIndex: workerInfo.parallelIndex });
   });
   test.afterAll(async () => {
     await handle?.stop();
   });
 
   const fetchTheme = async (name: string) => {
-    const res = await fetch(`${handle.baseUrl}/api/themes/${name}`, {
-      signal: AbortSignal.timeout(2_000),
-    });
+    const res = await fetch(`${handle.baseUrl}/api/themes/${name}`, { signal: AbortSignal.timeout(2_000) });
     expect(res.ok, `${name} did not return`).toBe(true);
     return res.json();
   };
@@ -83,13 +78,7 @@ test("structured view settings persist through PATCH + reload, node_path is stri
   const patchRes = await fetch(settingsUrl, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      acp: {
-        ...baselineAcp,
-        auto_stop_idle_secs: newIdle,
-        node_path: "/tmp/evil-node",
-      },
-    }),
+    body: JSON.stringify({ acp: { ...baselineAcp, auto_stop_idle_secs: newIdle, node_path: "/tmp/evil-node" } }),
   });
   expect(patchRes.ok).toBeTruthy();
   const after = await getJson(settingsUrl);
@@ -159,34 +148,42 @@ test.describe("passphrase mode", () => {
     expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
   });
 
-  test("sandbox image change needs no elevation for loopback and ignores a forged X-Forwarded-For", async ({
-    servePreauthed,
-    page,
-  }) => {
+  test("sandbox image change requires elevation for remote callers, not loopback", async ({ servePreauthed, page }) => {
     const profile = await defaultProfile(servePreauthed);
     await bootDashboard(page, servePreauthed);
-    // Forwarded headers count only behind --behind-proxy or --remote, so a forged one from a
-    // direct loopback caller must not turn it into a remote caller (#2610). The remote
-    // elevation path is covered by the behind-proxy e2e in tests/e2e/serve.rs.
+    // From the page, so the SPA's interceptor sees a 403 and opens the prompt. A TEST-NET-3
+    // X-Forwarded-For from a loopback socket resolves as a remote caller.
     const patchImage = (image: string, xff?: string) =>
       page.evaluate(
         async ({ profile, image, xff }) =>
           (
             await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
               method: "PATCH",
-              headers: {
-                "Content-Type": "application/json",
-                ...(xff ? { "X-Forwarded-For": xff } : {}),
-              },
+              headers: { "Content-Type": "application/json", ...(xff ? { "X-Forwarded-For": xff } : {}) },
               body: JSON.stringify({ sandbox: { default_image: image } }),
             })
           ).status,
         { profile, image, xff },
       );
+    const savedImage = async () =>
+      (await getJson(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`, servePreauthed))
+        ?.sandbox?.default_image;
 
+    // #2610: loopback is trusted and must not loop the prompt.
     expect(await patchImage("ghcr.io/example/img:local-trusted")).toBe(200);
-    expect(await patchImage("ghcr.io/example/img:forged-xff", "203.0.113.10")).toBe(200);
     await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+
+    expect(await patchImage("ghcr.io/example/img:tampered", "203.0.113.10")).toBe(403);
+    const dialog = confirmPassphraseDialog(page);
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    expect((await savedImage()) ?? "").not.toBe("ghcr.io/example/img:tampered");
+
+    // Elevation is per session, so the remote retry succeeds.
+    await dialog.locator('input[type="password"]').fill(servePreauthed.passphrase!);
+    await dialog.getByRole("button", { name: /Confirm/i }).click();
+    await expect(dialog).toHaveCount(0, { timeout: 5_000 });
+    expect(await patchImage("ghcr.io/example/img:elevated", "203.0.113.10")).toBe(200);
+    expect(await savedImage()).toBe("ghcr.io/example/img:elevated");
   });
 });
 
@@ -221,9 +218,7 @@ test("global settings migrate from profiles and reject stale profile writes", as
   const staleOverride = await fetch(profileUrl, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session: { sidebar_position: "right", default_tool: "claude" },
-    }),
+    body: JSON.stringify({ session: { sidebar_position: "right", default_tool: "claude" } }),
   });
   expect(staleOverride.status).toBe(400);
   expect((await staleOverride.json()).message).toContain("session.sidebar_position");

@@ -175,9 +175,9 @@ fn cli_serve_daemon_lifecycle() {
     assert!(!pid_path.exists(), "serve.pid cleaned up after --stop");
 }
 
-/// Under `--auth=passphrase` without a proxy flag a loopback caller is fs-trusted and
-/// gets through with no credential, a forged `X-Forwarded-For` changes nothing, and
-/// login still works (#1525, #3843).
+/// Under `--auth=passphrase` a remote caller (loopback socket plus a trusted
+/// `X-Forwarded-For`) is walled off until it logs in, while a real loopback
+/// caller is fs-trusted and gets through with no credential (#1525, #3843).
 #[test]
 #[parallel]
 fn cli_serve_auth_passphrase_wall_and_loopback_bypass() {
@@ -191,8 +191,6 @@ fn cli_serve_auth_passphrase_wall_and_loopback_bypass() {
         let base = format!("http://127.0.0.1:{port}");
         let client = Client::new();
 
-        // Forwarded headers are ignored without --behind-proxy or --remote: a forged one
-        // from a direct loopback caller is still the loopback owner, not a walled-off remote.
         for path in ["/api/about", "/api/sessions"] {
             let (status, body) = status_of(
                 client
@@ -201,7 +199,10 @@ fn cli_serve_auth_passphrase_wall_and_loopback_bypass() {
                 path,
             )
             .await;
-            assert!(status.is_success(), "forged XFF {path} should 200: {body}");
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+            if path == "/api/about" {
+                assert_eq!(body["error"].as_str(), Some("login_required"), "{body}");
+            }
         }
 
         let login = client

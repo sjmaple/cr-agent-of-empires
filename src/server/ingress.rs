@@ -58,11 +58,30 @@ impl Ingress {
             } else {
                 peer_ip
             },
-            local_trusted: !proxy_mode && peer_ip.is_loopback(),
+            local_trusted: !proxy_mode && peer_ip.is_loopback() && !names_a_forwarder(headers),
             plaintext_remote: !externally_secure && (!peer_ip.is_loopback() || forwarded_plaintext),
             externally_secure,
         }
     }
+}
+
+/// Headers a reverse proxy adds. A loopback peer sending any of them without proxy mode is
+/// an unflagged same-host proxy fronting remote callers, so it fails closed rather than
+/// inheriting the local-owner bypass. A local process forging one only demotes itself.
+const FORWARDING_HEADERS: [&str; 7] = [
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "forwarded",
+    "x-real-ip",
+    "cf-connecting-ip",
+];
+
+fn names_a_forwarder(headers: &HeaderMap) -> bool {
+    FORWARDING_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
 }
 
 /// The last comma-separated element of the last line of `name`: the entry the nearest proxy
@@ -135,10 +154,18 @@ mod tests {
             ("x-forwarded-for", "203.0.113.50"),
             ("x-forwarded-proto", "https"),
         ];
-        // Without proxy mode, even a loopback peer's headers are ignored.
+        // Without proxy mode a loopback peer's headers assert nothing, but sending one
+        // marks an unflagged same-host proxy, which is never a local owner.
         let direct = resolve("127.0.0.1", &forged, false);
         assert_eq!(direct.client_ip, ip("127.0.0.1"));
-        assert!(direct.local_trusted && !direct.externally_secure && !direct.plaintext_remote);
+        assert!(!direct.local_trusted && !direct.externally_secure && !direct.plaintext_remote);
+        for name in FORWARDING_HEADERS {
+            assert!(
+                !resolve("127.0.0.1", &[(name, "x")], false).local_trusted,
+                "{name}"
+            );
+        }
+        assert!(resolve("127.0.0.1", &[("user-agent", "aoe")], false).local_trusted);
         // A remote peer cannot assert TLS or identity in either mode.
         for proxy_mode in [false, true] {
             let remote = resolve("198.51.100.7", &forged, proxy_mode);
@@ -360,9 +387,15 @@ mod tests {
                         build_test_app_state_ingress(token.clone(), Some("hunter2"), true, false);
                     let (status, _) = probe(proxied, "127.0.0.1", &headers).await;
                     assert_eq!(status, StatusCode::UNAUTHORIZED, "{why} {identity:?}");
-                    // The same request without proxy mode is a direct local owner.
-                    let direct = build_test_app_state_ingress(token, Some("hunter2"), false, false);
-                    let (status, _) = probe(direct, "127.0.0.1", &headers).await;
+                    // Without proxy mode the same request is walled when it carries forwarding
+                    // headers (an unflagged same-host proxy), and a local owner when it does not.
+                    let direct = || {
+                        build_test_app_state_ingress(token.clone(), Some("hunter2"), false, false)
+                    };
+                    let (status, _) = probe(direct(), "127.0.0.1", &headers).await;
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "unflagged proxy {why}");
+                    let plain = [("host", "localhost"), ("authorization", bearer.as_str())];
+                    let (status, _) = probe(direct(), "127.0.0.1", &plain).await;
                     assert_eq!(status, StatusCode::OK, "direct {why}");
                 }
             }
