@@ -81,7 +81,9 @@ fn modified_after(mtime: SystemTime, started_at: DateTime<Utc>) -> bool {
 /// An idle row whose agent binary was replaced after launch. Reads only the row and the
 /// filesystem, so it is safe to call while painting.
 pub fn binary_updated(inst: &Instance) -> bool {
-    if inst.status != Status::Idle || inst.is_archived() || inst.is_trashed() {
+    // A sandboxed agent runs the container's copy, which host files say nothing about.
+    if inst.status != Status::Idle || inst.is_archived() || inst.is_trashed() || inst.is_sandboxed()
+    {
         return false;
     }
     let stale = if inst.is_structured() {
@@ -166,6 +168,35 @@ mod tests {
         assert_eq!(adapter_command(&inst, &record("my-custom")), None);
         inst.command = "wrapper".into();
         assert_eq!(adapter_command(&inst, &record("claude")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sandboxed_row_is_never_flagged_by_host_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("agent");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut inst = Instance::new("t", "/tmp");
+        inst.status = Status::Idle;
+        inst.command = bin.to_str().unwrap().into();
+        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        assert!(binary_updated(&inst));
+
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "alpine".to_string(),
+            container_name: "sandbox".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert!(!binary_updated(&inst));
     }
 
     #[test]
