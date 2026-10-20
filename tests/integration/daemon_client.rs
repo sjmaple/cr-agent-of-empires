@@ -348,6 +348,7 @@ async fn daemon_client_http_contract() {
             status: StatusCode::UNAUTHORIZED,
             ref body,
             truncated: false,
+            code: None,
         } if body.is_empty()
     ));
     stalled_body.abort();
@@ -368,6 +369,7 @@ async fn daemon_client_http_contract() {
         status,
         body,
         truncated,
+        ..
     } = error
     else {
         panic!("expected status error");

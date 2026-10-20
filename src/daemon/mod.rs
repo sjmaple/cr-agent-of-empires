@@ -61,6 +61,8 @@ pub enum DaemonClientError {
         status: StatusCode,
         body: String,
         truncated: bool,
+        /// The validated `AoE-Error-Code`, read from the headers even when the body is not.
+        code: Option<AoeErrorCode>,
     },
     #[error("daemon response exceeded the {limit}-byte limit")]
     ResponseTooLarge { limit: usize },
@@ -145,11 +147,13 @@ impl DaemonClient {
 
         let status = response.status();
         if !status.is_success() {
+            let code = AoeErrorCode::from_response(status, response.headers());
             if self.authenticated() {
                 return Err(DaemonClientError::Status {
                     status,
                     body: String::new(),
                     truncated: false,
+                    code,
                 });
             }
             let (body, truncated) = self.read_error_body(&mut response).await?;
@@ -157,6 +161,7 @@ impl DaemonClient {
                 status,
                 body,
                 truncated,
+                code,
             });
         }
 

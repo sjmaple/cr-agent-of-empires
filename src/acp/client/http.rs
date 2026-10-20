@@ -644,10 +644,10 @@ impl HttpClient {
             .list_sessions(state)
             .await
             .map_err(|error| match error {
-                crate::daemon::DaemonClientError::Status { status, .. }
-                    if status == StatusCode::UNAUTHORIZED =>
+                crate::daemon::DaemonClientError::Status { status, code, .. }
+                    if status == StatusCode::UNAUTHORIZED || code.is_some() =>
                 {
-                    HttpError::Unauthorized
+                    classify_coded(status, code, Scope::Global)
                 }
                 error => HttpError::Daemon(error),
             })
@@ -831,12 +831,15 @@ async fn finish(res: reqwest::Response, scope: Scope<'_>) -> Result<reqwest::Res
 /// Status plus the safe `AoE-Error-Code` header decide the error. The body is never read,
 /// so a stalled or reflecting server can neither delay nor steer classification.
 fn classify_error(status: StatusCode, headers: &header::HeaderMap, scope: Scope<'_>) -> HttpError {
+    classify_coded(status, AoeErrorCode::from_response(status, headers), scope)
+}
+
+fn classify_coded(status: StatusCode, code: Option<AoeErrorCode>, scope: Scope<'_>) -> HttpError {
     if status == StatusCode::UNAUTHORIZED {
         return HttpError::Unauthorized;
     }
     // `pending_target_gone` is only valid on a resolve operation, which has its own classifier.
-    let code = AoeErrorCode::from_response(status, headers)
-        .filter(|code| *code != AoeErrorCode::PendingTargetGone);
+    let code = code.filter(|code| *code != AoeErrorCode::PendingTargetGone);
     match (code, scope) {
         (Some(AoeErrorCode::ReadOnly), _) => HttpError::ReadOnly,
         (Some(code), _) => HttpError::Refused(code),
@@ -1316,6 +1319,61 @@ mod tests {
         assert_eq!(state.login_manager.device_snapshot(None).await.len(), 1);
         state.shutdown.cancel();
         server.await.unwrap();
+    }
+
+    /// Authenticated session listing classifies from the status and exactly one
+    /// status-consistent `AoE-Error-Code`, never the body, and degrades to the generic
+    /// error for a missing, repeated or inconsistent header.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_list_errors_classify_from_the_safe_header_without_the_body() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let deadline = Duration::from_secs(10);
+        for (status, codes, expect) in [
+            ("403 Forbidden", &["read_only"][..], "read_only"),
+            ("403 Forbidden", &["access_policy_denied"], "access_policy"),
+            ("403 Forbidden", &["cityhall_mode"], "cityhall"),
+            ("403 Forbidden", &["read_only", "cityhall_mode"], "generic"),
+            ("403 Forbidden", &["bogus"], "generic"),
+            ("404 Not Found", &["read_only"], "generic"),
+            ("403 Forbidden", &[], "generic"),
+            ("500 Internal Server Error", &[], "generic"),
+        ] {
+            let headers: String = codes
+                .iter()
+                .map(|code| format!("AoE-Error-Code: {code}\r\n"))
+                .collect();
+            let head: &'static str = Box::leak(
+                format!("HTTP/1.1 {status}\r\n{headers}Content-Length: 1000000\r\n\r\n")
+                    .into_boxed_str(),
+            );
+            let (base, server) = stalled_body_server(head).await;
+            let client =
+                HttpClient::new(DaemonEndpoint::new(base, Some("tok".into()), Source::Env))
+                    .unwrap();
+            let error = tokio::time::timeout(deadline, client.list_sessions(None))
+                .await
+                .expect("listing waited on the error body")
+                .unwrap_err();
+            let matched = matches!(
+                (&error, expect),
+                (HttpError::ReadOnly, "read_only")
+                    | (
+                        HttpError::Refused(AoeErrorCode::AccessPolicyDenied),
+                        "access_policy"
+                    )
+                    | (HttpError::Refused(AoeErrorCode::CityhallMode), "cityhall")
+                    | (
+                        HttpError::Daemon(crate::daemon::DaemonClientError::Status {
+                            code: None,
+                            ..
+                        }),
+                        "generic"
+                    )
+            );
+            assert!(matched, "{status} {codes:?}: {error:?}");
+            server.abort();
+        }
     }
 
     /// A failed step-up must not replace the daemon's own 403 with a misleading 401.
