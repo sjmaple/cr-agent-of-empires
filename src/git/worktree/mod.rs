@@ -16,6 +16,7 @@ use super::template::{resolve_template, TemplateVars};
 
 /// Remote assumed when no candidate remote can be picked from local refs.
 const FETCH_REMOTE: &str = "origin";
+const GIT_POINTER_TMP: &str = ".git.aoe-pointer.tmp";
 
 /// Bound for local metadata mutations that normally take milliseconds but can
 /// hang on a stalled filesystem.
@@ -248,7 +249,13 @@ impl GitWorktree {
         if pointer == original {
             return Ok(None);
         }
-        std::fs::write(&git_file, pointer)?;
+        // Rename keeps `.git` whole if the write fails partway.
+        let tmp = worktree_path.join(GIT_POINTER_TMP);
+        std::fs::write(&tmp, pointer)
+            .and_then(|()| std::fs::rename(&tmp, &git_file))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })?;
         Ok(Some(original))
     }
 

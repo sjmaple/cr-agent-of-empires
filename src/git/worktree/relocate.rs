@@ -1043,4 +1043,20 @@ mod tests {
             .unwrap();
         assert!(Path::new(OsStr::from_bytes(target)).exists());
     }
+
+    #[test]
+    fn convert_git_file_to_absolute_leaves_the_original_when_the_write_fails() {
+        let root = TempDir::new().unwrap();
+        let admin = root.path().join("admin");
+        std::fs::create_dir(&admin).unwrap();
+        let worktree = root.path().join("wt");
+        std::fs::create_dir(&worktree).unwrap();
+        let original = b"gitdir: ../admin\n".to_vec();
+        std::fs::write(worktree.join(".git"), &original).unwrap();
+        // A directory at the temp path makes the write fail deterministically.
+        std::fs::create_dir(worktree.join(crate::git::worktree::GIT_POINTER_TMP)).unwrap();
+
+        assert!(GitWorktree::convert_git_file_to_absolute(&worktree).is_err());
+        assert_eq!(std::fs::read(worktree.join(".git")).unwrap(), original);
+    }
 }
