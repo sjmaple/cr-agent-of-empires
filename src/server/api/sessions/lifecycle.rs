@@ -1264,10 +1264,7 @@ pub async fn restart_for_update(
             .acp_event_store
             .pending_approval_requests(&id)
             .is_empty();
-    let resume_available = matches!(
-        context_resume_for(&instance),
-        ContextResumeAvailability::Available
-    );
+    let resume_available = update_restart_resumable(&instance, &context_resume_for(&instance));
     if !crate::session::update_restart::offer_pending(&instance, resume_available, structured_ready)
     {
         return api_error(

@@ -154,10 +154,10 @@ pub(crate) async fn list_sessions_envelope(
             }
             session.update_restart = crate::session::update_restart::offer_pending(
                 inst,
-                matches!(
-                    session.context_resume,
-                    Some(ContextResumeAvailability::Available)
-                ),
+                session
+                    .context_resume
+                    .as_ref()
+                    .is_some_and(|resume| update_restart_resumable(inst, resume)),
                 acp_worker_state == crate::daemon::AcpWorkerState::Running
                     && session.pending_approvals.is_empty(),
             );

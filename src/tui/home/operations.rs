@@ -352,8 +352,13 @@ impl HomeView {
         self.get_instance(id).is_some_and(|inst| {
             crate::session::update_restart::offer_pending(
                 inst,
-                inst.terminal_context_resume_cached()
-                    == crate::session::TerminalContextResume::Available,
+                match inst.terminal_context_resume_cached() {
+                    crate::session::TerminalContextResume::Available => true,
+                    crate::session::TerminalContextResume::RuntimeCheckRequired => {
+                        inst.agent_session_id.is_some()
+                    }
+                    _ => false,
+                },
                 false,
             )
         })

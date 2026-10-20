@@ -4398,6 +4398,27 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
         "inherited trust needs no new record"
     );
 }
+
+#[test]
+fn update_restart_needs_a_captured_session_id_unless_resume_is_proven() {
+    let mut inst = Instance::new("t", "/tmp");
+    let unchecked = ContextResumeAvailability::Indeterminate {
+        reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+    };
+    let handshake = ContextResumeAvailability::Indeterminate {
+        reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+    };
+    assert!(update_restart_resumable(
+        &inst,
+        &ContextResumeAvailability::Available
+    ));
+    assert!(!update_restart_resumable(&inst, &unchecked));
+    assert!(!update_restart_resumable(&inst, &handshake));
+    inst.agent_session_id = Some("sid".into());
+    assert!(update_restart_resumable(&inst, &unchecked));
+    assert!(!update_restart_resumable(&inst, &handshake));
+}
+
 #[tokio::test]
 async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
     let mut inst = Instance::new("fresh-agent", "/tmp/fresh-agent");

@@ -235,6 +235,21 @@ pub(super) fn truncate_title(s: &str, max: usize) -> String {
     out
 }
 
+/// A plain session keeps `RuntimeCheckRequired` until a resume probe runs, so a captured
+/// agent session id is the evidence that a restart keeps the conversation.
+pub(super) fn update_restart_resumable(
+    inst: &Instance,
+    resume: &ContextResumeAvailability,
+) -> bool {
+    match resume {
+        ContextResumeAvailability::Available => true,
+        ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+        } => inst.agent_session_id.is_some(),
+        _ => false,
+    }
+}
+
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
     if inst.is_structured() {
         return if inst.fork_pending.is_some() {
