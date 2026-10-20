@@ -1274,6 +1274,15 @@ pub async fn restart_for_update(
         );
     }
 
+    apply_update_restart(&state, id, instance).await
+}
+
+/// Restart an eligible session onto the updated agent. The caller holds the instance lock.
+pub(super) async fn apply_update_restart(
+    state: &Arc<AppState>,
+    id: String,
+    instance: Instance,
+) -> axum::response::Response {
     if instance.is_structured() {
         // The reconciler terminates the worker once its turn drains and respawns it against the
         // stored conversation.
@@ -1288,7 +1297,7 @@ pub async fn restart_for_update(
     // The button promises the conversation survives, so resume even if the user turned off
     // auto-resume for ordinary restarts.
     restart_plain_session(
-        &state,
+        state,
         id,
         instance,
         crate::session::ResumeAttemptPolicy::Allow,

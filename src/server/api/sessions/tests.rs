@@ -4440,6 +4440,20 @@ async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
 }
 
 #[tokio::test]
+async fn update_restart_of_a_structured_session_defers_to_the_reconciler() {
+    let mut inst = Instance::new("structured-agent", "/tmp/structured-agent");
+    inst.id = "structured-agent".to_string();
+    inst.view = crate::session::View::Structured;
+    let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+    let response = apply_update_restart(&state, inst.id.clone(), inst).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        state.acp_supervisor.respawn_pending_ids(),
+        vec!["structured-agent".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     use crate::acp::permissions::build_approval;
     use crate::acp::state::ToolCall;
