@@ -441,10 +441,7 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(&id)
             .await;
-        let lock = support::lock_profile_dir_for_test("default");
-        if !lock.blocks_writes() {
-            return;
-        }
+        let failure = support::fail_profile_writes_for_test("default");
         assert_eq!(pick().await.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             state.instances.read().await[0].agent_model.as_deref(),
@@ -457,7 +454,7 @@ mod tests {
             Some("old-model")
         );
 
-        drop(lock);
+        drop(failure);
         state
             .acp_supervisor
             .test_insert_worker_cmd_recording(&id)

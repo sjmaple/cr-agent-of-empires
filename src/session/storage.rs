@@ -829,6 +829,35 @@ pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option
     }
 }
 
+/// Profiles whose writes fail, for handler tests that build their own `Storage`.
+#[cfg(test)]
+static FAILING_PROFILES_FOR_TEST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Fails every write to `profile` until dropped; the row stays loadable.
+#[cfg(test)]
+pub(crate) struct ProfileWriteFailure(String);
+
+#[cfg(test)]
+impl ProfileWriteFailure {
+    pub(crate) fn new(profile: &str) -> Self {
+        FAILING_PROFILES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(profile.to_string());
+        Self(profile.to_string())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProfileWriteFailure {
+    fn drop(&mut self) {
+        FAILING_PROFILES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p| p != &self.0);
+    }
+}
+
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
@@ -1244,7 +1273,12 @@ impl Storage {
             self.file_watch.notify_local_change(&groups_path);
         }
         #[cfg(test)]
-        if self.fail_writes_for_test {
+        if self.fail_writes_for_test
+            || FAILING_PROFILES_FOR_TEST
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&self.profile)
+        {
             anyhow::bail!("injected sessions write failure");
         }
 
