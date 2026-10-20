@@ -26,6 +26,23 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
     mouse.keys.clear();
     mouse.copies.clear();
     match &view.state {
+        ServeViewState::Checking { .. } => render_pending(
+            frame,
+            area,
+            theme,
+            " Checking... ",
+            "Looking for a running daemon",
+        ),
+        ServeViewState::Spawning { mode, .. } => render_pending(
+            frame,
+            area,
+            theme,
+            match mode {
+                ServeMode::Tunnel => " Starting HTTPS tunnel... ",
+                ServeMode::Local => " Starting local server... ",
+            },
+            "Launching the daemon",
+        ),
         ServeViewState::ModePicker {
             selected,
             tunnel_available,
@@ -413,6 +430,15 @@ fn render_confirm(
         Style::default().fg(theme.dimmed),
     );
     record_hints(frame, mouse, keys);
+}
+
+fn render_pending(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, line: &str) {
+    let inner = render_page(frame, area, title, theme.border, theme.title);
+    frame.render_widget(
+        Paragraph::new(Line::styled(line, Style::default().fg(theme.text)))
+            .alignment(Alignment::Center),
+        centered_rect(inner, inner.width, 1),
+    );
 }
 
 fn render_starting(
@@ -875,25 +901,18 @@ mod tests {
     /// bundle must say the endpoint is API-only instead of drawing a code nothing answers.
     #[test]
     fn active_screen_matches_the_dashboard_feature() {
-        let view = ServeView {
-            state: ServeViewState::Active {
-                mode: ServeMode::Local,
-                transport: None,
-                urls: vec![ServeUrl {
-                    label: Some("lan".to_string()),
-                    url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
-                }],
-                url_index: 0,
-                passphrase: None,
-                opened_at: Instant::now(),
-                log_offset: 0,
-            },
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-        };
+        let view = ServeView::with_state(ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: Some("lan".to_string()),
+                url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        });
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
             .unwrap();
@@ -933,14 +952,7 @@ mod tests {
     }
 
     fn view(state: ServeViewState) -> ServeView {
-        ServeView {
-            state,
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-        }
+        ServeView::with_state(state)
     }
 
     fn draw(view: &ServeView) -> ratatui::buffer::Buffer {

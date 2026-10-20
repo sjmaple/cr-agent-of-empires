@@ -3,12 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use rand::prelude::IndexedRandom;
 use rand::RngExt;
 
 use super::words::PASSPHRASE_WORDS;
-use super::{ServeMode, TransportStatus, TunnelTransport};
+use super::{Job, JobDone, ServeMode, TransportStatus, TunnelTransport};
 
 const LOG_TAIL_LINES: usize = 200;
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
@@ -141,7 +142,9 @@ pub(crate) async fn start_local_daemon_and_wait(
 ) -> Result<crate::acp::client::DaemonEndpoint, String> {
     use crate::acp::client::{discovery::discover, HttpClient};
 
-    spawn_daemon(ServeMode::Local, None, None)?;
+    tokio::task::spawn_blocking(|| spawn_daemon(ServeMode::Local, None, None))
+        .await
+        .map_err(|e| format!("daemon launch task failed: {e}"))??;
     // A warm start takes about 1s; 20s covers a cold start without wedging the UI.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
@@ -287,6 +290,25 @@ pub(super) fn restart_daemon(
 ) -> Result<(), String> {
     stop_daemon()?;
     spawn_daemon(mode, passphrase, transport)
+}
+
+pub(super) fn run_job(job: Job) -> JobDone {
+    match job {
+        Job::Probe => JobDone::Probe(crate::cli::serve::daemon_pid().is_some()),
+        Job::Launch {
+            restart,
+            mode,
+            transport,
+            passphrase,
+        } => JobDone::Launched(if restart {
+            restart_daemon(mode, passphrase.as_deref(), transport).inspect(|()| {
+                // A reused Tailscale tunnel is back almost at once; skip the Starting flash.
+                std::thread::sleep(Duration::from_millis(200));
+            })
+        } else {
+            spawn_daemon(mode, passphrase.as_deref(), transport)
+        }),
+    }
 }
 
 pub(super) fn read_serve_mode() -> Option<ServeMode> {
