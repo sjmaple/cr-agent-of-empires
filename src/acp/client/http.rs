@@ -146,6 +146,17 @@ enum Scope<'a> {
     Global,
 }
 
+/// `GET` and `PATCH /api/log-level` answers; each leaves out the fields the other owns.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct LogFilterReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    pub current: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reloadable: Option<bool>,
+    pub ephemeral: bool,
+}
+
 impl HttpClient {
     pub fn new(endpoint: DaemonEndpoint) -> Result<Self, HttpError> {
         let url = crate::daemon::parse_base_url(&endpoint.base_url)?;
@@ -692,9 +703,11 @@ impl HttpClient {
 
     /// Cheapest authenticated probe: separates a down host (transport error)
     /// from misconfigured auth (401).
-    /// The daemon's tracing filter, replaced first when `patch` is given. Returns the
-    /// response body.
-    pub async fn log_level(&self, patch: Option<&serde_json::Value>) -> Result<String, HttpError> {
+    /// The daemon's tracing filter, replaced first when `patch` is given.
+    pub async fn log_level(
+        &self,
+        patch: Option<&serde_json::Value>,
+    ) -> Result<LogFilterReply, HttpError> {
         let res = match patch {
             None => {
                 self.send(
@@ -711,7 +724,7 @@ impl HttpClient {
                 .await?
             }
         };
-        Ok(res.text().await?)
+        Ok(res.json().await?)
     }
 
     pub async fn health_check(&self) -> Result<(), HttpError> {
@@ -1299,7 +1312,7 @@ mod tests {
         });
         let client = HttpClient::new(DaemonEndpoint::new(base, Some(token), Source::Env)).unwrap();
         let body = client.log_level(None).await.unwrap();
-        assert!(body.contains("reloadable"), "{body}");
+        assert_eq!(body.reloadable, Some(false), "{body:?}");
         assert_eq!(state.login_manager.device_snapshot(None).await.len(), 1);
         state.shutdown.cancel();
         server.await.unwrap();

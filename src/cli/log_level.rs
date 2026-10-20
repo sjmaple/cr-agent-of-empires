@@ -47,7 +47,10 @@ pub async fn run(args: LogLevelArgs) -> Result<()> {
         })
     };
 
-    println!("{}", client.log_level(patch.as_ref()).await?);
+    println!(
+        "{}",
+        serde_json::to_string(&client.log_level(patch.as_ref()).await?)?
+    );
     Ok(())
 }
 
