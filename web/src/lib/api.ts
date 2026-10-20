@@ -810,8 +810,8 @@ export function updateMachineSettings(updates: Record<string, unknown>): Promise
 // Theme, tour, tips and acknowledgement flags use dedicated endpoints so these
 // cosmetic writes stay off the passphrase/elevation wall of PATCH /api/settings.
 
-export function updateTheme(patch: { name?: string; color_mode?: string }): Promise<boolean> {
-  return fetchOk("/api/theme", jsonInit("PATCH", patch));
+export function updateTheme(patch: { name?: string; color_mode?: string }): Promise<SaveOutcome> {
+  return announceOutcome(sendSave("/api/theme", jsonInit("PATCH", patch)));
 }
 
 export function markWebTourSeen(): Promise<boolean> {
