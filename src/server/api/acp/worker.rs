@@ -308,13 +308,14 @@ async fn check_switch_target(
 }
 
 /// Persist the backend and model together, clearing adapter-specific resume state.
+/// Disk first: memory is untouched on failure so it keeps matching the stored row.
 async fn persist_agent_switch(
     state: &AppState,
     profile: &str,
     id: &str,
     target: &str,
     model: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     let _reload = state.session_service.disk_mutation_guard().await;
     let switch = |inst: &mut crate::session::Instance| {
         inst.agent_name = Some(target.to_string());
@@ -323,36 +324,22 @@ async fn persist_agent_switch(
         inst.acp_effort = None;
         inst.agent_model = model.map(str::to_string);
     };
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            switch(inst);
-            state
-                .mutation_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-    match crate::session::Storage::new(profile, state.file_watch.clone()) {
-        Ok(storage) => {
-            if let Err(e) = storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    switch(inst);
-                }
-                Ok(())
-            }) {
-                tracing::error!(
-                    target: "http.api.acp",
-                    session = %id,
-                    "failed to persist agent_name after switch: {e}"
-                );
+    crate::session::Storage::new(profile, state.file_watch.clone())?.update(
+        |instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                switch(inst);
             }
-        }
-        Err(e) => tracing::error!(
-            target: "http.api.acp",
-            session = %id,
-            "failed to open storage to persist agent_name after switch: {e}"
-        ),
+            Ok(())
+        },
+    )?;
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        switch(inst);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    Ok(())
 }
 
 /// Move a structured session to another ACP backend, keeping the transcript.
@@ -460,18 +447,21 @@ pub async fn switch_acp_agent(
     {
         return supervisor_error_response("spawn failed", &e);
     }
-    state
-        .telemetry_structured
-        .agent_switches
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    persist_agent_switch(
+    if let Err(e) = persist_agent_switch(
         &state,
         &instance.source_profile,
         &id,
         &target,
         model.as_deref(),
     )
-    .await;
+    .await
+    {
+        return persist_failure_response(&state, &id, &e).await;
+    }
+    state
+        .telemetry_structured
+        .agent_switches
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let reason = req
         .reason
@@ -861,7 +851,9 @@ mod tests {
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
             let stale = crate::server::reload::load_all_instances(&state.file_watch);
-            persist_agent_switch(&state, profile, &id, "codex", requested).await;
+            persist_agent_switch(&state, profile, &id, "codex", requested)
+                .await
+                .unwrap();
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
                 stale,
@@ -887,6 +879,38 @@ mod tests {
             assert_eq!(live.agent_model.as_deref(), expected);
             assert_eq!(live.agent_name.as_deref(), Some("codex"));
         }
+    }
+
+    /// A failed write leaves memory on the stored agent, so the reload and the
+    /// live row cannot disagree about which backend the session runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_agent_switch_write_leaves_memory_unchanged() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-fail");
+        inst.view = crate::session::View::Structured;
+        inst.agent_name = Some("claude".to_string());
+        inst.acp_effort = Some("high".to_string());
+        inst.source_profile = "blocked".to_string();
+        let id = inst.id.clone();
+        crate::server::test_support::block_profile_storage_for_test("blocked");
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let epoch = || {
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let before = epoch();
+
+        persist_agent_switch(&state, "blocked", &id, "codex", Some("gpt-5.6-sol"))
+            .await
+            .unwrap_err();
+
+        let memory = state.instances.read().await;
+        assert_eq!(memory[0].agent_name.as_deref(), Some("claude"));
+        assert_eq!(memory[0].acp_effort.as_deref(), Some("high"));
+        assert_eq!(epoch(), before);
     }
 
     /// The pick reaches both stores, and the model resets to the provider's
