@@ -2123,7 +2123,9 @@ async fn startup_recovery_probe_does_not_block_and_a_running_daemon_skips_recove
 
     env.view.maybe_start_startup_recovery();
     env.view.maybe_start_startup_recovery();
-    entered_rx.recv().unwrap();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("probe never entered");
     assert!(env.view.recovery_probe_in_flight);
 
     // The held probe leaves the event loop's tick runnable and recovery unstarted.
