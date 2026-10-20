@@ -34,10 +34,14 @@ fn binary_mtime(binary: &str) -> Option<SystemTime> {
             return *mtime;
         }
     }
-    let mtime = which::which(binary)
-        .and_then(|path| std::fs::metadata(path).map_err(|_| which::Error::CannotFindBinaryPath))
-        .ok()
-        .and_then(|m| m.modified().ok());
+    let mtime = which::which(binary).ok().and_then(|path| {
+        // A package manager may keep a fixed mtime on the target but recreate the bin symlink.
+        let target = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let link = std::fs::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .ok();
+        target.max(link)
+    });
     cache.insert(binary.to_string(), (Instant::now(), mtime));
     mtime
 }
