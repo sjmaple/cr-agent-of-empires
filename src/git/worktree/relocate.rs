@@ -1003,4 +1003,41 @@ mod tests {
         git_wt.move_worktree(&trash, &original).unwrap();
         run_git(&original, &["status", "--porcelain"]);
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn convert_git_file_to_absolute_preserves_non_utf8_admin_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = TempDir::new().unwrap();
+        let admin = root.path().join(OsStr::from_bytes(b"admin-\xff"));
+        // EILSEQ and EINVAL signal a filesystem rejecting non-UTF-8 names.
+        if let Err(err) = std::fs::create_dir(&admin) {
+            assert!(
+                matches!(err.raw_os_error(), Some(libc::EILSEQ) | Some(libc::EINVAL)),
+                "non-UTF-8 name probe failed for another reason: {err}"
+            );
+            eprintln!(
+                "skipping convert_git_file_to_absolute_preserves_non_utf8_admin_path_bytes: {} refuses non-UTF-8 names",
+                root.path().display()
+            );
+            return;
+        }
+        std::os::unix::fs::symlink(&admin, root.path().join("link")).unwrap();
+        let worktree = root.path().join("wt");
+        std::fs::create_dir(&worktree).unwrap();
+        let original = b"gitdir: ../link\n".to_vec();
+        std::fs::write(worktree.join(".git"), &original).unwrap();
+
+        let returned = GitWorktree::convert_git_file_to_absolute(&worktree).unwrap();
+
+        let mut expected = b"gitdir: ".to_vec();
+        expected.extend_from_slice(admin.canonicalize().unwrap().as_os_str().as_bytes());
+        expected.push(b'\n');
+        assert_eq!(returned, Some(original));
+        assert_eq!(std::fs::read(worktree.join(".git")).unwrap(), expected);
+        assert!(crate::git::cleanup::read_linked_worktree_gitdir(&worktree)
+            .unwrap()
+            .exists());
+    }
 }
