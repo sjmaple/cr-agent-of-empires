@@ -115,6 +115,7 @@ async fn cancel_under_flood() {
         mode: ConnectMode::Fresh {
             stored_acp_session_id: None,
             seed_history_replay: false,
+            prior_conversation: false,
             fork_from: None,
         },
         ready_tx,
@@ -205,6 +206,7 @@ async fn auth_status_is_cleared_per_adapter_process() {
     let fresh = || ConnectMode::Fresh {
         stored_acp_session_id: None,
         seed_history_replay: false,
+        prior_conversation: false,
         fork_from: None,
     };
     let reattach = ConnectMode::Resume {
@@ -343,6 +345,7 @@ async fn spawn_fake_connection(
         mode: ConnectMode::Fresh {
             stored_acp_session_id: None,
             seed_history_replay: false,
+            prior_conversation: false,
             fork_from: None,
         },
         ready_tx,
