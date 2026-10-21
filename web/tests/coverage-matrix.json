@@ -600,6 +600,23 @@
       ]
     },
     {
+      "id": "settings.logs-tab",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/LogsSettings.test.tsx",
+        "src/components/__tests__/SettingsView.test.tsx"
+      ],
+      "components": ["web/src/components/settings/LogsSettings.tsx", "web/src/components/SettingsView.tsx"]
+    },
+    {
+      "id": "settings.logs-endpoint-access",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/logs-endpoint.spec.ts"],
+      "components": ["src/server/api/logs.rs"]
+    },
+    {
       "id": "settings.cityhall-export",
       "kind": "vitest",
       "risk": "medium",
